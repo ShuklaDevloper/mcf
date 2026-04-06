@@ -16,11 +16,21 @@ def read_secret():
     secrets = {}
     script_dir = os.path.dirname(os.path.abspath(__file__))
     secret_path = os.path.join(script_dir, "secret.txt")
-    with open(secret_path, "r", encoding="utf-8") as f:
-        for line in f:
-            if "=" in line:
-                k, v = line.strip().split("=", 1)
-                secrets[k.strip()] = v.strip()
+    if os.path.exists(secret_path):
+        with open(secret_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if "=" in line:
+                    k, v = line.strip().split("=", 1)
+                    secrets[k.strip()] = v.strip()
+    
+    try:
+        import streamlit as st
+        for k, v in st.secrets.items():
+            if k not in secrets and isinstance(v, str):
+                secrets[k] = v
+    except Exception:
+        pass
+        
     return secrets
 
 def get_access_token(config):
@@ -130,7 +140,17 @@ def process_orders():
     scopes = ['https://www.googleapis.com/auth/spreadsheets']
     script_dir = os.path.dirname(os.path.abspath(__file__))
     creds_path = os.path.join(script_dir, 'hide.json')
-    creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
+    
+    if os.path.exists(creds_path):
+        creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
+    else:
+        try:
+            import streamlit as st
+            creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
+        except Exception as e:
+            print("Google Service Account auth failed. Please provide hide.json or st.secrets['gcp_service_account']: " + str(e))
+            return
+            
     service = build('sheets', 'v4', credentials=creds)
     
     # NEW SHEET ID

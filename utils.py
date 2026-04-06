@@ -36,13 +36,23 @@ def read_secret(file_name="secret.txt"):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     path = os.path.join(script_dir, file_name)
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                if "=" in line and not line.strip().startswith("#"):
-                    k, v = line.strip().split("=", 1)
-                    secrets[k.strip()] = v.strip()
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if "=" in line and not line.strip().startswith("#"):
+                        k, v = line.strip().split("=", 1)
+                        secrets[k.strip()] = v.strip()
     except Exception as e:
         print(f"[utils] secret.txt read error: {e}")
+
+    try:
+        import streamlit as st
+        for k, v in st.secrets.items():
+            if k not in secrets and isinstance(v, str):
+                secrets[k] = v
+    except Exception:
+        pass
+
     return secrets
 
 
@@ -134,7 +144,16 @@ def init_sheets_service():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     script_dir = os.path.dirname(os.path.abspath(__file__))
     creds_path = os.path.join(script_dir, "hide.json")
-    creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
+    
+    if os.path.exists(creds_path):
+        creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
+    else:
+        try:
+            import streamlit as st
+            creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
+        except Exception as e:
+            raise Exception("hide.json missing, and st.secrets['gcp_service_account'] not found: " + str(e))
+            
     return build("sheets", "v4", credentials=creds)
 
 
