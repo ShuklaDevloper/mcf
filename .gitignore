@@ -1,0 +1,8 @@
+__pycache__/
+*.db
+secret.txt
+hide.json
+.claude/
+*.csv
+bulk_tracking.json
+.env
