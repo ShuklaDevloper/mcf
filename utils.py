@@ -157,12 +157,39 @@ def init_sheets_service():
     return build("sheets", "v4", credentials=creds)
 
 
+def ensure_sheet_capacity(service, sheet_id, max_row_needed):
+    """Automatically add rows to the sheet if the requested row exceeds current grid capacity."""
+    try:
+        sheet_metadata = service.spreadsheets().get(spreadsheetId=sheet_id).execute()
+        for sheet in sheet_metadata.get('sheets', []):
+            if sheet.get("properties", {}).get("title") == "Sheet1":
+                grid = sheet.get("properties", {}).get("gridProperties", {})
+                current_rows = grid.get("rowCount", 0)
+                sheet_id_int = sheet.get("properties", {}).get("sheetId", 0)
+                if max_row_needed > current_rows:
+                    add_rows = max_row_needed - current_rows + 500
+                    body = {
+                        "requests": [{
+                            "appendDimension": {
+                                "sheetId": sheet_id_int,
+                                "dimension": "ROWS",
+                                "length": add_rows
+                            }
+                        }]
+                    }
+                    service.spreadsheets().batchUpdate(spreadsheetId=sheet_id, body=body).execute()
+                break
+    except Exception as e:
+        print("[utils] ensure_sheet_capacity error:", e)
+
 def update_sheet_remarks(service, sheet_id, updates):
     """Batch update columns Q (source) and R (status) for given row numbers.
     updates = [{"row": 2, "source": "MCF", "status": "Fulfilled"}, ...]
     """
     if not updates:
         return
+    max_row = max(u['row'] for u in updates)
+    ensure_sheet_capacity(service, sheet_id, max_row)
     data = [
         {
             "range": f"Sheet1!Q{u['row']}:R{u['row']}",
@@ -182,6 +209,8 @@ def update_sheet_tracking(service, sheet_id, updates):
     """
     if not updates:
         return
+    max_row = max(u['row'] for u in updates)
+    ensure_sheet_capacity(service, sheet_id, max_row)
     from datetime import datetime
     now_str = datetime.now().strftime("%d/%m %H:%M")
     data = []

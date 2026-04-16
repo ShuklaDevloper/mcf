@@ -33,6 +33,7 @@ from utils import (
     validate_pincode,
 )
 from w import fetch_mcf_data
+from live_tracker import run_live_tracking_update
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
@@ -187,8 +188,10 @@ def fetch_endpoint_orders():
             "status": o.get("status", ""),
         }
 
-        if not source and not fulfilled:
-            row["select"] = True
+        is_err = "error" in str(fulfilled).lower() or "fail" in str(fulfilled).lower() or "error" in str(o.get("status", "")).lower()
+        if (not source and not fulfilled) or is_err:
+            row["select"] = False if is_err else True
+            row["is_error"] = is_err
             row["path"] = "MCF"
             pending.append(row)
         elif source:
@@ -348,20 +351,23 @@ def page_orders():
                     key=f"pending_editor_{key}",
                 )
 
-            t_single, t_multi, t_repeat = st.tabs(["⏳ Single Orders", "📦 Multi SKU/Unit Orders", "⚠️ Repeated Customers"])
+            t_single, t_multi, t_repeat, t_error = st.tabs(["⏳ Single Orders", "📦 Multi SKU/Unit Orders", "⚠️ Repeated Customers", "❌ Error / Retry Orders"])
             
             with t_single:
-                mask1 = (~df["is_multi"]) & (~df["is_repeat"])
+                mask1 = (~df["is_multi"]) & (~df["is_repeat"]) & (~df.get("is_error", False))
                 edit1 = render_grid(df[mask1], "single")
             with t_multi:
-                mask2 = (df["is_multi"]) & (~df["is_repeat"])
+                mask2 = (df["is_multi"]) & (~df["is_repeat"]) & (~df.get("is_error", False))
                 edit2 = render_grid(df[mask2], "multi")
             with t_repeat:
-                mask3 = df["is_repeat"]
+                mask3 = (df["is_repeat"]) & (~df.get("is_error", False))
                 edit3 = render_grid(df[mask3], "repeat")
+            with t_error:
+                mask4 = df.get("is_error", False)
+                edit4 = render_grid(df[mask4], "error")
 
             edit_pieces = []
-            for e in [edit1, edit2, edit3]:
+            for e in [edit1, edit2, edit3, edit4]:
                 if not e.empty: edit_pieces.append(e)
             
             if edit_pieces:
@@ -652,8 +658,39 @@ def _shopify_fulfill(order_id, shopify_cfg, tracking_info=None):
 # PAGE 3: TRACKING
 # ─────────────────────────────────────────────
 def page_tracking():
-    st.title("🚚 Tracking — MCF AWB Fetch")
+    st.title("🚚 Tracking Hub")
+    tab_awb, tab_live = st.tabs(["📦 AWB Fetch (MCF)", "🟢 Live Transit Updates"])
+    
+    with tab_live:
+        _render_live_updates()
+        
+    with tab_awb:
+        _render_awb_fetch()
 
+def _render_live_updates():
+    st.info(
+        "ℹ️ **Live Tracker:** यह टूल Swiship (Amazon) और Delhivery की API का उपयोग करके शीट में मौजूद ट्रैकिंग नम्बरों को ट्रैक करता है "
+        "और शीट के अंत में 'Status', 'ETA', 'Pickup/Delivery Date' और 'RTO' वाले कॉलम भर देता है।"
+    )
+    if st.button("▶ Run Full Live Tracking Update", type="primary"):
+        prog = st.progress(0)
+        status_txt = st.empty()
+        
+        def cb(idx, total, no):
+            prog.progress((idx + 1) / total)
+            status_txt.text(f"Tracking: {no} ({idx + 1}/{total})")
+            
+        with st.spinner("Fetching data and querying APIs..."):
+            res = run_live_tracking_update(progress_callback=cb)
+            status_txt.text("✅ Sheet Updated with Live Status")
+            if res:
+                df = pd.DataFrame(res)
+                # Ensure the 'Status' column exists before trying to display it specifically
+                st.dataframe(df, use_container_width=True, hide_index=True)
+            else:
+                st.warning("No tracking numbers found to update.")
+
+def _render_awb_fetch():
     st.info(
         "ℹ️ **MCF tracking Amazon ke ship karne ke 1-2 din baad milti hai.** "
         "Yahan Sheet ke saare MCF orders dikhte hain — MCF status (Planning/Shipped) ke saath. "
@@ -671,7 +708,7 @@ def page_tracking():
                 mcf_orders = []
                 for o in data.get("orders", []):
                     source = str(o.get("source", "")).strip().upper()
-                    if "MCF" in source:
+                    if "MCF" in source or "DELHI" in source:
                         mcf_orders.append({
                             "row_number":   int(o.get("row_number", 0) or 0),
                             "order_id":     str(o.get("ord_serial", "")).replace("#", "").strip(),
@@ -736,108 +773,57 @@ def page_tracking():
 
                     for i, order in enumerate(need_trk):
                         order_id = order["order_id"]
+                        orig_source = str(order.get("source", "")).upper()
                         status_txt.text(f"Checking {order_id} ({i+1}/{total})...")
 
-                        tn, cc, mcf_status, raw = fetch_mcf_data(order_id, token)
+                        tn, cc, mcf_status = "", "", ""
+                        is_delhivery_first = "DELHI" in orig_source
+                        del_api_key = secrets.get("DELHIVERY_API_KEY", "")
+
+                        if not is_delhivery_first:
+                            tn, cc, mcf_status, _ = fetch_mcf_data(order_id, token)
 
                         # Status label for sheet remark
                         if tn:
                             from datetime import datetime as _dt
                             remark = f"Tracking Added {_dt.now().strftime('%d/%m %H:%M')}"
                             db.update_order_tracking(order_id, cc or "", tn, "")
-
-                            # Shopify fulfill with tracking
                             t_info = {"number": tn, "company": cc or "Amazon", "url": ""}
                             s_ok, s_msg = _shopify_fulfill(order_id, shopify_cfg, tracking_info=t_info)
 
-                            sheet_updates.append({
-                                "row":        order["row_number"],
-                                "carrier":    cc or "Amazon",
-                                "tracking_no": tn,
-                                "url":        "",
-                                "remark":     remark,
-                            })
-                            result_rows.append({
-                                "Order ID":   order_id,
-                                "Customer":   order["customer"],
-                                "MCF Status": mcf_status,
-                                "Tracking ID": tn,
-                                "Carrier":    cc or "",
-                                "Shopify":    "✅ Fulfilled" if s_ok else f"⚠️ {s_msg}",
-                                "Sheet":      "✅ Updated",
-                            })
+                            sheet_updates.append({"row": order["row_number"], "carrier": cc or "Amazon", "tracking_no": tn, "url": "", "remark": remark})
+                            result_rows.append({"Order ID": order_id, "Customer": order["customer"], "Status": mcf_status, "Tracking ID": tn, "Carrier": cc or "", "Shopify": "✅ Fulfilled" if s_ok else f"⚠️ {s_msg}", "Sheet": "✅ Updated"})
                         else:
-                            # ── Delhivery fallback: only when MCF says NotFound ──
-                            if mcf_status == "NotFound":
-                                del_api_key = secrets.get("DELHIVERY_API_KEY", "")
-                                del_found, del_awb, del_status, del_err = get_delhivery_tracking(del_api_key, order_id)
+                            # ── Delhivery Check (Either Fallback or Primary) ──
+                            if is_delhivery_first or mcf_status == "NotFound":
+                                del_found, del_awb, del_status, _ = get_delhivery_tracking(del_api_key, order_id)
                                 if del_found and del_awb:
-                                    # Found on Delhivery — treat like a tracking hit
                                     from datetime import datetime as _dt
                                     remark = f"Delhivery AWB {_dt.now().strftime('%d/%m %H:%M')}"
                                     db.update_order_tracking(order_id, "Delhivery", del_awb, "")
-
-                                    # Shopify fulfill with Delhivery tracking
                                     t_info = {"number": del_awb, "company": "Delhivery", "url": ""}
                                     s_ok, s_msg = _shopify_fulfill(order_id, shopify_cfg, tracking_info=t_info)
 
-                                    # Sheet: Q=Delhivery R=Fulfilled, S=Delhivery T=AWB V=remark
-                                    sheet_updates.append({
-                                        "row":        order["row_number"],
-                                        "carrier":    "Delhivery",
-                                        "tracking_no": del_awb,
-                                        "url":        "",
-                                        "remark":     remark,
-                                    })
-                                    no_trk_remark_updates.append({
-                                        "row":    order["row_number"],
-                                        "source": "Delhivery",
-                                        "status": f"Fulfilled | {del_status}" if del_status else "Fulfilled",
-                                    })
-                                    result_rows.append({
-                                        "Order ID":   order_id,
-                                        "Customer":   order["customer"],
-                                        "MCF Status": "NotFound → Delhivery",
-                                        "Tracking ID": del_awb,
-                                        "Carrier":    "Delhivery",
-                                        "Shopify":    "✅ Fulfilled" if s_ok else f"⚠️ {s_msg}",
-                                        "Sheet":      "✅ Delhivery AWB added",
-                                    })
+                                    sheet_updates.append({"row": order["row_number"], "carrier": "Delhivery", "tracking_no": del_awb, "url": "", "remark": remark})
+                                    no_trk_remark_updates.append({"row": order["row_number"], "source": "Delhivery", "status": f"Fulfilled | {del_status}" if del_status else "Fulfilled"})
+                                    result_rows.append({"Order ID": order_id, "Customer": order["customer"], "Status": "Found on Delhivery", "Tracking ID": del_awb, "Carrier": "Delhivery", "Shopify": "✅ Fulfilled" if s_ok else f"⚠️ {s_msg}", "Sheet": "✅ Delhivery AWB"})
                                     prog.progress((i + 1) / total)
                                     time.sleep(0.4)
-                                    continue  # skip the no-tracking block below
+                                    continue  # Move to next order
 
-                            # No tracking, no Delhivery fallback — write MCF status to R
-                            status_label = {
-                                "Planning":    "MCF: Planning",
-                                "Received":    "MCF: Received",
-                                "Processing":  "MCF: Processing",
-                                "Complete":    "MCF: Complete",
-                                "Cancelled":   "MCF: Cancelled",
-                                "NotFound":    "MCF: Not Found",
-                            }.get(mcf_status, f"MCF: {mcf_status}")
+                            # Not found anywhere. Create proper status label based on source
+                            if is_delhivery_first:
+                                status_label = "Delhivery: Not Found"
+                                mcf_status = "NotFound"
+                            else:
+                                status_label = {
+                                    "Planning": "MCF: Planning", "Received": "MCF: Received", "Processing": "MCF: Processing",
+                                    "Complete": "MCF: Complete", "Cancelled": "MCF: Cancelled", "NotFound": "MCF: Not Found"
+                                }.get(mcf_status, f"MCF: {mcf_status}")
 
-                            sheet_updates.append({
-                                "row":        order["row_number"],
-                                "carrier":    "",
-                                "tracking_no": "",
-                                "url":        "",
-                                "remark":     status_label,
-                            })
-                            no_trk_remark_updates.append({
-                                "row":    order["row_number"],
-                                "source": "MCF",
-                                "status": status_label,
-                            })
-                            result_rows.append({
-                                "Order ID":   order_id,
-                                "Customer":   order["customer"],
-                                "MCF Status": mcf_status,
-                                "Tracking ID": "—",
-                                "Carrier":    "—",
-                                "Shopify":    "—",
-                                "Sheet":      f"✅ R col: {status_label}",
-                            })
+                            sheet_updates.append({"row": order["row_number"], "carrier": "", "tracking_no": "", "url": "", "remark": status_label})
+                            no_trk_remark_updates.append({"row": order["row_number"], "source": "Delhivery" if is_delhivery_first else "MCF", "status": status_label})
+                            result_rows.append({"Order ID": order_id, "Customer": order["customer"], "Status": mcf_status if not is_delhivery_first else "Delhivery Not Found", "Tracking ID": "—", "Carrier": "—", "Shopify": "—", "Sheet": f"✅ R col: {status_label}"})
 
                         prog.progress((i + 1) / total)
                         time.sleep(0.4)
