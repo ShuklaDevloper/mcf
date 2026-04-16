@@ -347,6 +347,16 @@ def get_sync_logs(limit=100):
     return [dict(r) for r in rows]
 
 
+def get_all_phones():
+    """Fetch all customer phones to check for repeated customers."""
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT DISTINCT customer_phone FROM orders WHERE customer_phone IS NOT NULL AND customer_phone != ''")
+    rows = c.fetchall()
+    conn.close()
+    return {r["customer_phone"] for r in rows}
+
+
 def get_stats():
     """Return dashboard statistics dict."""
     conn = get_connection()

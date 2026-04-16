@@ -148,3 +148,39 @@ def bulk_fetch_tracking(
         time.sleep(delay)
 
     return results
+
+if __name__ == "__main__":
+    import sys
+    from utils import read_secret, get_shopify_config, get_shopify_order, fulfill_order
+    from db import update_order_tracking
+    
+    secrets = read_secret()
+    order_id = sys.argv[1] if len(sys.argv) > 1 else input("Enter Order ID manually to track & update: ").strip()
+    if order_id:
+        print(f"Fetching tracking for: {order_id}...")
+        res = bulk_fetch_tracking(secrets, [order_id])
+        print("Tracking Result:", res)
+        
+        info = res[0]
+        if info.get("tracking_number"):
+            tn = info["tracking_number"]
+            cc = info["carrier"] or "Amazon"
+            print(f"> Found Tracking Number: {tn} via {cc}")
+            
+            print("> Updating Database...")
+            update_order_tracking(order_id, cc, tn, "")
+            
+            print("> Updating Shopify...")
+            shopify_cfg = get_shopify_config(secrets)
+            if shopify_cfg.get("shop_url"):
+                s_order = get_shopify_order(order_id, shopify_cfg["headers"], shopify_cfg["shop_url"])
+                if s_order:
+                    t_info = {"number": tn, "company": cc, "url": ""}
+                    fulfilled = fulfill_order(s_order, shopify_cfg["headers"], shopify_cfg["shop_url"], tracking_info=t_info)
+                    print(f"  Shopify fulfillment status: {'Updated' if fulfilled else 'No action needed/Failed'}")
+                else:
+                    print("  Order not found on Shopify.")
+            else:
+                print("  Shopify not configured.")
+        else:
+            print("> No tracking found yet. Status:", info.get("mcf_status"))

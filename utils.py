@@ -325,6 +325,15 @@ def create_mcf_order(token, order_data):
             "isCodRequired": True,
             "codCharge": {"currencyCode": "INR", "value": str(order_data.get("amount", "0"))},
         }
+    else:
+        # FBA India Prepaid orders workaround
+        payload["paymentInformationList"] = [
+            {
+               "paymentTransactionId": str(order_data.get("order_id", "prepaid")),
+               "paymentMode": "CashOnDelivery",
+               "paymentDate": parse_date(order_data.get("date", ""))
+            }
+        ]
 
     try:
         r = requests.post(MCF_API_URL, headers=headers, json=payload, verify=False, timeout=30)

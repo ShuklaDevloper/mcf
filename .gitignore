@@ -6,3 +6,6 @@ hide.json
 *.csv
 bulk_tracking.json
 .env
+secrets.toml
+.streamlit/secrets.toml
+hide.toml

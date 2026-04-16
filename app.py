@@ -121,6 +121,11 @@ def fetch_endpoint_orders():
         return [], [], "Endpoint returned success=false"
 
     pending, processed = [], []
+    try:
+        repeat_phones = db.get_all_phones()
+    except Exception:
+        repeat_phones = set()
+
     for o in data.get("orders", []):
         source = str(o.get("source", "")).strip()
         fulfilled = str(o.get("fulfilled", "")).strip()
@@ -142,6 +147,17 @@ def fetch_endpoint_orders():
             else ""
         )
 
+        raw_qty = str(o.get("qty", "1")).strip()
+        seller_sku = str(o.get("seller_sku", "")).strip()
+        
+        is_multi = False
+        if "," in raw_qty or "," in seller_sku:
+            is_multi = True
+        elif raw_qty.isdigit() and int(raw_qty) > 1:
+            is_multi = True
+            
+        is_repeat = phone in repeat_phones
+
         row = {
             "row_number": int(o.get("row_number", 0) or 0),
             "order_id": order_id,
@@ -156,9 +172,12 @@ def fetch_endpoint_orders():
             "state_code": o.get("state_code", ""),
             "city": o.get("city", ""),
             "is_cod": o.get("is_cod", ""),
-            "seller_sku": o.get("seller_sku", ""),
+            "seller_sku": seller_sku,
             "title": o.get("title", ""),
-            "qty": (int(str(o.get("qty", 1)).strip()) if str(o.get("qty", "1")).strip().isdigit() else 1),
+            "qty": sum([int(q.strip()) for q in raw_qty.split(",") if q.strip().isdigit()]) if "," in raw_qty else (int(raw_qty) if raw_qty.isdigit() else 1),
+            "raw_qty": raw_qty,
+            "is_multi": is_multi,
+            "is_repeat": is_repeat,
             "address_valid": is_valid,
             "issue": issue,
             "source": source,
@@ -280,38 +299,75 @@ def page_orders():
             c2.metric("Valid", total - invalid)
             c3.metric("Address Issues", invalid)
 
+            st.markdown("---")
+            b1, b2 = st.columns([1, 4])
+            if b1.button("☑️ Select All Pending"):
+                st.session_state.pending_df["select"] = True
+                st.rerun()
+            if b2.button("🔲 Unselect All Pending"):
+                st.session_state.pending_df["select"] = False
+                st.rerun()
+
             # Editable table
             display_cols = [
                 "select", "order_id", "customer", "phone",
-                "address_valid", "issue",
+                "address_valid", "issue", "raw_qty", "seller_sku",
                 "addr_line1", "addr_line2", "addr_line3",
                 "city", "state_code", "pincode",
                 "amount", "is_cod", "path"
             ]
-            edit_df = st.data_editor(
-                df[display_cols].copy(),
-                column_config={
-                    "select":         st.column_config.CheckboxColumn("☑", default=True),
-                    "order_id":       st.column_config.TextColumn("Order ID"),
-                    "customer":       st.column_config.TextColumn("Customer"),
-                    "phone":          st.column_config.TextColumn("Phone"),
-                    "address_valid":  st.column_config.CheckboxColumn("✓ Addr", disabled=True),
-                    "issue":          st.column_config.TextColumn("Issue"),
-                    "addr_line1":     st.column_config.TextColumn("Addr L1 (60)"),
-                    "addr_line2":     st.column_config.TextColumn("Addr L2 (60)"),
-                    "addr_line3":     st.column_config.TextColumn("Addr L3 (60)"),
-                    "city":           st.column_config.TextColumn("City"),
-                    "state_code":     st.column_config.TextColumn("State"),
-                    "pincode":        st.column_config.TextColumn("Pin"),
-                    "amount":         st.column_config.NumberColumn("Amount ₹"),
-                    "is_cod":         st.column_config.TextColumn("Payment"),
-                    "path":           st.column_config.SelectboxColumn("Path", options=["MCF", "Delhivery"]),
-                },
-                hide_index=True,
-                use_container_width=True,
-                num_rows="fixed",
-                key="pending_editor",
-            )
+            
+            def render_grid(sub_df, key):
+                if sub_df.empty:
+                    st.info(f"No orders in {key}.")
+                    return sub_df.copy()
+                return st.data_editor(
+                    sub_df[display_cols].copy(),
+                    column_config={
+                        "select":         st.column_config.CheckboxColumn("☑", default=True),
+                        "order_id":       st.column_config.TextColumn("Order ID", disabled=True),
+                        "customer":       st.column_config.TextColumn("Customer", disabled=True),
+                        "phone":          st.column_config.TextColumn("Phone"),
+                        "address_valid":  st.column_config.CheckboxColumn("✓ Addr", disabled=True),
+                        "issue":          st.column_config.TextColumn("Issue", disabled=True),
+                        "raw_qty":        st.column_config.TextColumn("Qty", disabled=True),
+                        "seller_sku":     st.column_config.TextColumn("SKU", disabled=True),
+                        "addr_line1":     st.column_config.TextColumn("Addr L1 (60)"),
+                        "addr_line2":     st.column_config.TextColumn("Addr L2 (60)"),
+                        "addr_line3":     st.column_config.TextColumn("Addr L3 (60)"),
+                        "city":           st.column_config.TextColumn("City"),
+                        "state_code":     st.column_config.TextColumn("State"),
+                        "pincode":        st.column_config.TextColumn("Pin"),
+                        "amount":         st.column_config.NumberColumn("Amount ₹"),
+                        "is_cod":         st.column_config.TextColumn("Payment", disabled=True),
+                        "path":           st.column_config.SelectboxColumn("Path", options=["MCF", "Delhivery"]),
+                    },
+                    hide_index=True,
+                    use_container_width=True,
+                    num_rows="fixed",
+                    key=f"pending_editor_{key}",
+                )
+
+            t_single, t_multi, t_repeat = st.tabs(["⏳ Single Orders", "📦 Multi SKU/Unit Orders", "⚠️ Repeated Customers"])
+            
+            with t_single:
+                mask1 = (~df["is_multi"]) & (~df["is_repeat"])
+                edit1 = render_grid(df[mask1], "single")
+            with t_multi:
+                mask2 = (df["is_multi"]) & (~df["is_repeat"])
+                edit2 = render_grid(df[mask2], "multi")
+            with t_repeat:
+                mask3 = df["is_repeat"]
+                edit3 = render_grid(df[mask3], "repeat")
+
+            edit_pieces = []
+            for e in [edit1, edit2, edit3]:
+                if not e.empty: edit_pieces.append(e)
+            
+            if edit_pieces:
+                edit_df = pd.concat(edit_pieces)
+            else:
+                edit_df = df[display_cols].copy()
 
             # Build selected rows from edit_df (do NOT write back to session_state
             # on every render — that causes the double-click checkbox bug)
@@ -415,12 +471,39 @@ def _process_orders(full_df, selected, mcf_sel, del_sel):
                 order_id = row["order_id"]
                 status_text.text(f"MCF: Processing {order_id}...")
 
-                items = [{
-                    "sellerSku": row["seller_sku"],
-                    "sellerFulfillmentOrderItemId": f"{row['seller_sku']}-{order_id}",
-                    "quantity": int(row["qty"]),
-                    "perUnitDeclaredValue": {"currencyCode": "INR", "value": str(row["amount"])},
-                }]
+                skus = [s.strip() for s in str(row.get("seller_sku", "")).split(",") if s.strip()]
+                raw_qty = str(row.get("raw_qty", row.get("qty", "1")))
+                qtys_str = [q.strip() for q in raw_qty.split(",") if q.strip()]
+
+                if len(qtys_str) == 1 and len(skus) > 1:
+                    qtys = [int(qtys_str[0])]*len(skus)
+                else:
+                    qtys = [int(q) if q.isdigit() else 1 for q in qtys_str]
+
+                while len(qtys) < len(skus):
+                    qtys.append(1)
+
+                items = []
+                # Distribute amount across items roughly
+                amount_per_item = float(row["amount"]) / max(1, len(skus))
+                
+                for idx, sku in enumerate(skus):
+                    if not sku: continue
+                    items.append({
+                        "sellerSku": sku,
+                        "sellerFulfillmentOrderItemId": f"{sku}-{order_id}-{idx}",
+                        "quantity": qtys[idx],
+                        "perUnitDeclaredValue": {"currencyCode": "INR", "value": str(round(amount_per_item, 2))},
+                    })
+                
+                if not items:
+                    # Fallback single item
+                    items = [{
+                        "sellerSku": "Unknown",
+                        "sellerFulfillmentOrderItemId": f"Unknown-{order_id}-0",
+                        "quantity": 1,
+                        "perUnitDeclaredValue": {"currencyCode": "INR", "value": str(row["amount"])},
+                    }]
 
                 order_data = dict(row) | {"items": items}
                 success, msg = create_mcf_order(token, order_data)
