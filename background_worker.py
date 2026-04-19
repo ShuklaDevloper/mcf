@@ -75,6 +75,16 @@ def auto_fetch_source_orders():
             full_addr = f"{o.get('address1', '')} {o.get('address2', '')}".strip()
             addr1, addr2, addr3, _ = validate_address(full_addr)
 
+            is_cod_flag = str(o.get("is_cod", "")).lower() in ["true", "yes", "1", "cod"]
+            if is_cod_flag:
+                payment_info = []
+            else:
+                payment_info = [{
+                    "PaymentMethod": "Prepaid",
+                    "PaymentAmount": float(o.get("amount", 0)),
+                    "CurrencyCode": "INR"
+                }]
+
             order_data = {
                 "order_id": order_id,
                 "date": o.get("date", ""),
@@ -93,6 +103,7 @@ def auto_fetch_source_orders():
                 "qty": int(o.get("qty", 1) or 1),
                 "row_number": int(o.get("row_number", 0) or 0),
                 "source_channel": "SHOPIFY",
+                "payment_info": payment_info,
                 "items": [{
                     "seller_sku": o.get("seller_sku", ""),
                     "title": o.get("title", ""),
