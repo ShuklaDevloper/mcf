@@ -303,13 +303,6 @@ def page_orders():
             c3.metric("Address Issues", invalid)
 
             st.markdown("---")
-            b1, b2 = st.columns([1, 4])
-            if b1.button("☑️ Select All Pending"):
-                st.session_state.pending_df["select"] = True
-                st.rerun()
-            if b2.button("🔲 Unselect All Pending"):
-                st.session_state.pending_df["select"] = False
-                st.rerun()
 
             # Editable table
             display_cols = [
@@ -351,19 +344,33 @@ def page_orders():
                     key=f"pending_editor_{key}",
                 )
 
+            def render_tab_buttons(mask_series, key_prefix):
+                b1, b2, _ = st.columns([1.5, 1.5, 4])
+                if b1.button("☑️ Select All", key=f"sel_{key_prefix}"):
+                    st.session_state.pending_df.loc[mask_series, "select"] = True
+                    st.rerun()
+                if b2.button("🔲 Unselect All", key=f"unsel_{key_prefix}"):
+                    st.session_state.pending_df.loc[mask_series, "select"] = False
+                    st.rerun()
+
             t_single, t_multi, t_repeat, t_error = st.tabs(["⏳ Single Orders", "📦 Multi SKU/Unit Orders", "⚠️ Repeated Customers", "❌ Error / Retry Orders"])
             
             with t_single:
                 mask1 = (~df["is_multi"]) & (~df["is_repeat"]) & (~df.get("is_error", False))
+                render_tab_buttons(mask1, "single")
                 edit1 = render_grid(df[mask1], "single")
             with t_multi:
                 mask2 = (df["is_multi"]) & (~df["is_repeat"]) & (~df.get("is_error", False))
+                render_tab_buttons(mask2, "multi")
                 edit2 = render_grid(df[mask2], "multi")
             with t_repeat:
                 mask3 = (df["is_repeat"]) & (~df.get("is_error", False))
+                render_tab_buttons(mask3, "rep")
                 edit3 = render_grid(df[mask3], "repeat")
             with t_error:
                 mask4 = df.get("is_error", False)
+                if isinstance(mask4, bool): mask4 = pd.Series(mask4, index=df.index)
+                render_tab_buttons(mask4, "err")
                 edit4 = render_grid(df[mask4], "error")
 
             edit_pieces = []
@@ -379,7 +386,7 @@ def page_orders():
             # on every render — that causes the double-click checkbox bug)
             selected_ids = edit_df.loc[edit_df["select"] == True, "order_id"].tolist()
             # Merge path + address edits from edit_df into full df
-            edit_map = edit_df.set_index("order_id")[["path", "addr_line1", "addr_line2", "addr_line3", "phone", "pincode"]].to_dict("index")
+            edit_map = edit_df.drop_duplicates(subset=["order_id"]).set_index("order_id")[["path", "addr_line1", "addr_line2", "addr_line3", "phone", "pincode"]].to_dict("index")
             full_rows = df.copy()
             for oid, vals in edit_map.items():
                 mask = full_rows["order_id"] == oid
