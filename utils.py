@@ -356,13 +356,14 @@ def create_mcf_order(token, order_data):
         }
     else:
         # FBA India Prepaid orders workaround
-        payload["paymentInformationList"] = [
-            {
-               "paymentTransactionId": str(order_data.get("order_id", "prepaid")),
-               "paymentMode": "CashOnDelivery",
-               "paymentDate": parse_date(order_data.get("date", ""))
-            }
-        ]
+        payment_info = order_data.get("payment_info")
+        if not payment_info:
+            payment_info = [{
+                "PaymentMethod": "Prepaid",
+                "PaymentAmount": float(order_data.get("amount", 0)),
+                "CurrencyCode": "INR"
+            }]
+        payload["paymentInformationList"] = payment_info
 
     try:
         r = requests.post(MCF_API_URL, headers=headers, json=payload, verify=False, timeout=30)
