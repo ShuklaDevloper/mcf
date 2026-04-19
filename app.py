@@ -123,9 +123,15 @@ def fetch_endpoint_orders():
 
     pending, processed = [], []
     try:
-        repeat_phones = db.get_all_phones()
+        repeat_phones = set(db.get_all_phones())
     except Exception:
         repeat_phones = set()
+
+    current_batch_phones = {}
+    for o in data.get("orders", []):
+        p = clean_phone_number(o.get("phone", ""))
+        if p:
+            current_batch_phones[p] = current_batch_phones.get(p, 0) + 1
 
     for o in data.get("orders", []):
         source = str(o.get("source", "")).strip()
@@ -141,12 +147,19 @@ def fetch_endpoint_orders():
         phone_valid = len(phone) == 10
 
         is_valid = addr_valid and pin_valid and phone_valid
+        state_code = str(o.get("state_code", "")).strip().upper()
+        
         issue = (
             "Address overflow" if not addr_valid
             else "Invalid pincode" if not pin_valid
             else "Invalid phone" if not phone_valid
             else ""
         )
+
+        if state_code in ["UP", "UTTAR PRADESH", "DELHI", "NEW DELHI", "DL", "HARYANA", "HR"]:
+            issue = f"Blocked MCF State ({state_code})" if not issue else issue
+
+        is_cod_flag = str(o.get("is_cod", "")).lower() in ["true", "yes", "1", "cod"]
 
         raw_qty = str(o.get("qty", "1")).strip()
         seller_sku = str(o.get("seller_sku", "")).strip()
@@ -157,7 +170,7 @@ def fetch_endpoint_orders():
         elif raw_qty.isdigit() and int(raw_qty) > 1:
             is_multi = True
             
-        is_repeat = phone in repeat_phones
+        is_repeat = (phone in repeat_phones) or (current_batch_phones.get(phone, 0) > 1)
 
         row = {
             "row_number": int(o.get("row_number", 0) or 0),
@@ -186,9 +199,16 @@ def fetch_endpoint_orders():
             "tracking_no": o.get("tracking_no", ""),
             "carrier": o.get("carrier", ""),
             "status": o.get("status", ""),
+            "payment_info": [] if is_cod_flag else [{
+                "PaymentMethod": "Prepaid",
+                "PaymentAmount": float(o.get("amount", 0) or 0),
+                "CurrencyCode": "INR"
+            }]
         }
 
         is_err = "error" in str(fulfilled).lower() or "fail" in str(fulfilled).lower() or "error" in str(o.get("status", "")).lower()
+        if state_code in ["UP", "UTTAR PRADESH", "DELHI", "NEW DELHI", "DL", "HARYANA", "HR"]:
+            is_err = True
         if (not source and not fulfilled) or is_err:
             row["select"] = False if is_err else True
             row["is_error"] = is_err
@@ -484,6 +504,20 @@ def _process_orders(full_df, selected, mcf_sel, del_sel):
                 order_id = row["order_id"]
                 status_text.text(f"MCF: Processing {order_id}...")
 
+                # ── Check Shopify Fulfillment Status Before Processing ──
+                s_order = get_shopify_order(order_id, shopify_cfg["headers"], shopify_cfg["shop_url"])
+                if s_order and str(s_order.get("fulfillment_status", "")).lower() == "fulfilled":
+                    st.toast(f"{order_id} already fulfilled in Shopify. Skipping.", icon="⚠️")
+                    db.update_order_status(order_id, "ALREADY_FULFILLED", reason="Skipped")
+                    sheet_updates.append({"row": row["row_number"], "source": "Skipped", "status": "Already Fulfilled on Shopify"})
+                    log.append({
+                        "order_id": order_id, "path": "MCF", "ok": True,
+                        "msg": "Skipped (Already fulfilled)", "shopify": "Fulfilled", "tracking": "—"
+                    })
+                    done += 1
+                    progress.progress(done / total)
+                    continue
+
                 skus = [s.strip() for s in str(row.get("seller_sku", "")).split(",") if s.strip()]
                 raw_qty = str(row.get("raw_qty", row.get("qty", "1")))
                 qtys_str = [q.strip() for q in raw_qty.split(",") if q.strip()]
@@ -497,8 +531,9 @@ def _process_orders(full_df, selected, mcf_sel, del_sel):
                     qtys.append(1)
 
                 items = []
-                # Distribute amount across items roughly
-                amount_per_item = float(row["amount"]) / max(1, len(skus))
+                # Distribute amount across total units correctly so perUnitDeclaredValue is accurate
+                total_units = sum(qtys)
+                amount_per_item = float(row["amount"]) / max(1, total_units)
                 
                 for idx, sku in enumerate(skus):
                     if not sku: continue
@@ -556,6 +591,20 @@ def _process_orders(full_df, selected, mcf_sel, del_sel):
             for _, row in del_sel.iterrows():
                 order_id = row["order_id"]
                 status_text.text(f"Delhivery: Processing {order_id}...")
+
+                # ── Check Shopify Fulfillment Status Before Processing ──
+                s_order = get_shopify_order(order_id, shopify_cfg["headers"], shopify_cfg["shop_url"])
+                if s_order and str(s_order.get("fulfillment_status", "")).lower() == "fulfilled":
+                    st.toast(f"{order_id} already fulfilled in Shopify. Skipping.", icon="⚠️")
+                    db.update_order_status(order_id, "ALREADY_FULFILLED", reason="Skipped")
+                    sheet_updates.append({"row": row["row_number"], "source": "Skipped", "status": "Already Fulfilled on Shopify"})
+                    log.append({
+                        "order_id": order_id, "path": "Delhivery", "ok": True,
+                        "msg": "Skipped (Already fulfilled)", "shopify": "Fulfilled", "tracking": "—"
+                    })
+                    done += 1
+                    progress.progress(done / total)
+                    continue
 
                 order_data = dict(row) | {"total_qty": int(row["qty"])}
                 success, resp, err = create_delhivery_order(
