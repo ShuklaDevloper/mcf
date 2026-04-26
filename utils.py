@@ -18,12 +18,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ─────────────────────────────────────────────
 SHEET_ID = "1OvtzHInl8viaLG6f2ZLG3u5h6YQpfID2UAbI64cYhF4"
 
-APPS_SCRIPT_URL = (
-    "https://script.googleusercontent.com/macros/echo?"
-    "user_content_key=AWDtjMWYZwMO46eHzFtteYuy4wQghm1l09c3kacRIzE5AiKrMtLWoSfwaxzA60OPXgf2NTm9ANf9JgZw7ig4gyUuwOcA-payx3Yqwu9UCQnM7Qa80YBEdM-1OSqZxREYJvwfx8pT9vhCYNaPbvmw_wO3jDWraJ7mTImrlsquzw_6u7EjR4jmi2HnJ7f5rYccdaRj948aSr9fDuNlBKTTFr3jMHYOJtXNavmNE_sHGb5OxuskmEPoYrgKzmbgqBpZUnGnkg8VUGRsTiUWrsHxaR6pITQmifEYKdfM9pJJrd62EtnGZtxBeGFQbx4uI8MEr--7HcRhThGulJBOe-wcjU-f457ytgsFDQ"
-    "&lib=MdEaHStBrLRae2DEj9ygoGU-LqlQWFUuU"
-)
-
+APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxDNOr8zmH97UcLeF52AZ5O_uscSpe7tyTxrChbCpIuFnhpVSYZ-xlqreuOOvrBuH3O/exec"
 MCF_API_URL = "https://sellingpartnerapi-eu.amazon.com/fba/outbound/2020-07-01/fulfillmentOrders"
 MARKETPLACE_ID = "A21TJRUUN4KGV"  # India
 
