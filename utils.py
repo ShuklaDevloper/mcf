@@ -18,7 +18,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ─────────────────────────────────────────────
 SHEET_ID = "1OvtzHInl8viaLG6f2ZLG3u5h6YQpfID2UAbI64cYhF4"
 
-APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxDNOr8zmH97UcLeF52AZ5O_uscSpe7tyTxrChbCpIuFnhpVSYZ-xlqreuOOvrBuH3O/exec"
+APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxDNOr8zmH97UcLeF52AZ5O_uscSpe7tyTxrChbCpIuFnhpVSYZ-xlqreuOOvrBuH3O/exec?secret=shopify2025&action=get_orders&status=all"
 MCF_API_URL = "https://sellingpartnerapi-eu.amazon.com/fba/outbound/2020-07-01/fulfillmentOrders"
 MARKETPLACE_ID = "A21TJRUUN4KGV"  # India
 
