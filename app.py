@@ -87,13 +87,14 @@ PAGES = {
     "🚚 Tracking": "Tracking",
     "📈 Reports": "Reports",
     "🔄 Sync": "Sync",
+    "🛠️ Shopify Tools": "Shopify Tools",
 }
 
 with st.sidebar:
     st.markdown("## 📦 Fulfillment OMS")
     st.markdown("---")
     for label, page_id in PAGES.items():
-        if st.button(label, use_container_width=True, key=f"nav_{page_id}"):
+        if st.button(label, width='stretch', key=f"nav_{page_id}"):
             st.session_state.page = page_id
 
     st.markdown("---")
@@ -199,10 +200,12 @@ def fetch_endpoint_orders():
             "tracking_no": o.get("tracking_no", ""),
             "carrier": o.get("carrier", ""),
             "status": o.get("status", ""),
-            "payment_info": [] if is_cod_flag else [{
-                "PaymentMethod": "Prepaid",
-                "PaymentAmount": float(o.get("amount", 0) or 0),
-                "CurrencyCode": "INR"
+            "paymentInformationList": [] if is_cod_flag else [{
+                "paymentMethod": "Prepaid",
+                "paymentAmount": {
+                    "currencyCode": "INR",
+                    "value": str(round(float(o.get("amount", 0) or 0), 2))
+                }
             }]
         }
 
@@ -282,7 +285,7 @@ def page_dashboard():
         df = pd.DataFrame(recent)
         show_cols = ["order_id", "customer_name", "status", "fulfillment_channel", "tracking_number", "created_at"]
         show_cols = [c for c in show_cols if c in df.columns]
-        st.dataframe(df[show_cols], use_container_width=True, hide_index=True)
+        st.dataframe(df[show_cols], width='stretch', hide_index=True)
     else:
         st.info("No orders in local DB yet. Go to Sync to fetch orders.")
 
@@ -359,7 +362,7 @@ def page_orders():
                         "path":           st.column_config.SelectboxColumn("Path", options=["MCF", "Delhivery"]),
                     },
                     hide_index=True,
-                    use_container_width=True,
+                    width='stretch',
                     num_rows="fixed",
                     key=f"pending_editor_{key}",
                 )
@@ -437,7 +440,7 @@ def page_orders():
             show = ["order_id", "customer", "source", "fulfilled", "tracking_no", "carrier", "status"]
             show = [c for c in show if c in df2.columns]
             st.metric("Total Processed", len(df2))
-            st.dataframe(df2[show], use_container_width=True, hide_index=True)
+            st.dataframe(df2[show], width='stretch', hide_index=True)
 
     # ── PROCESSING LOG ───────────────────────────────────────────────────
     if st.session_state.processing_log:
@@ -460,7 +463,7 @@ def page_orders():
                 "Shopify":     entry.get("shopify", "—"),
                 "Tracking ID": entry.get("tracking", "—"),
             })
-        st.dataframe(pd.DataFrame(log_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(log_rows), width='stretch', hide_index=True)
 
         # Detail per order
         with st.expander("View order-by-order details"):
@@ -742,7 +745,7 @@ def _render_live_updates():
             if res:
                 df = pd.DataFrame(res)
                 # Ensure the 'Status' column exists before trying to display it specifically
-                st.dataframe(df, use_container_width=True, hide_index=True)
+                st.dataframe(df, width='stretch', hide_index=True)
             else:
                 st.warning("No tracking numbers found to update.")
 
@@ -802,7 +805,7 @@ def _render_awb_fetch():
             st.success("Sab orders ka tracking add ho chuka hai!")
         else:
             df_need = pd.DataFrame(need_trk)[["order_id", "customer", "amount", "row_number"]]
-            st.dataframe(df_need, use_container_width=True, hide_index=True)
+            st.dataframe(df_need, width='stretch', hide_index=True)
 
             st.markdown("---")
             btn_col1, btn_col2 = st.columns([2, 3])
@@ -911,7 +914,7 @@ def _render_awb_fetch():
                     rc1, rc2 = st.columns(2)
                     rc1.metric("Tracking Found", found_count)
                     rc2.metric("Still Pending", total - found_count)
-                    st.dataframe(pd.DataFrame(result_rows), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(result_rows), width='stretch', hide_index=True)
 
                     # Reload orders
                     st.session_state.tracking_sheet_orders = None
@@ -960,7 +963,7 @@ def _render_awb_fetch():
             st.info("Abhi kisi order ka tracking nahi aaya.")
         else:
             df_has = pd.DataFrame(has_trk)[["order_id", "customer", "tracking_no", "carrier", "fulfilled"]]
-            st.dataframe(df_has, use_container_width=True, hide_index=True)
+            st.dataframe(df_has, width='stretch', hide_index=True)
 
 
 # ─────────────────────────────────────────────
@@ -1001,7 +1004,7 @@ def page_reports():
 
     if orders:
         df = pd.DataFrame(orders)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width='stretch', hide_index=True)
 
         # CSV Export
         csv_buf = io.StringIO()
@@ -1086,6 +1089,15 @@ def page_sync():
                                 "price": o.get("amount", 0),
                             }],
                         }
+                        
+                        is_cod_flag_sync = str(o.get("is_cod", "")).lower() in ["true", "yes", "1", "cod"]
+                        order_data["paymentInformationList"] = [] if is_cod_flag_sync else [{
+                            "paymentMethod": "Prepaid",
+                            "paymentAmount": {
+                                "currencyCode": "INR",
+                                "value": str(round(float(o.get("amount", 0) or 0), 2))
+                            }
+                        }]
                         if db.save_order(order_data):
                             added += 1
 
@@ -1105,10 +1117,174 @@ def page_sync():
         df_logs = pd.DataFrame(logs)
         show_log = ["event_type", "status", "details", "timestamp"]
         show_log = [c for c in show_log if c in df_logs.columns]
-        st.dataframe(df_logs[show_log], use_container_width=True, hide_index=True)
+        st.dataframe(df_logs[show_log], width='stretch', hide_index=True)
     else:
         st.info("No sync logs yet.")
 
+
+# ─────────────────────────────────────────────
+# PAGE 6: SHOPIFY TOOLS
+# ─────────────────────────────────────────────
+def page_shopify_tools():
+    st.title("🛠️ Shopify Manual Tools")
+    st.info("💡 Yeh tool Shopify orders ko manually fulfill ya update karne ke liye hai, aur Google Sheet mein bhi automatically details push karta hai.")
+
+    def get_row_map():
+        try:
+            service = init_sheets_service()
+            result = service.spreadsheets().values().get(spreadsheetId=SHEET_ID, range='Sheet1!A:C').execute()
+            rows = result.get('values', [])
+            if not rows: return {}, service
+            
+            headers = [str(h).strip().lower() for h in rows[0]]
+            oid_idx = -1
+            for col in ["ord=", "ord_serial", "order id", "order"]:
+                if col in headers:
+                    oid_idx = headers.index(col)
+                    break
+            
+            if oid_idx == -1:
+                oid_idx = 1 # Fallback to col B
+                
+            row_map = {}
+            for i, row in enumerate(rows):
+                if len(row) > oid_idx:
+                    oid = str(row[oid_idx]).replace("#", "").strip()
+                    if oid:
+                        row_map[oid] = i + 1
+            return row_map, service
+        except Exception as e:
+            return {}, None
+
+    tab1, tab2 = st.tabs(["✅ Direct Fulfill", "🚚 Add / Update Tracking"])
+
+    shopify_cfg = get_shopify_config(secrets)
+
+    with tab1:
+        st.subheader("Bulk Mark Orders as Fulfilled")
+        st.write("Order IDs daalein (comma separated ya naye line mein). Shopify par bina tracking ke fulfill ho jayenge aur Sheet mein update ho jayenge.")
+        order_ids_input = st.text_area("Order IDs", height=150, key="tab1_oids", placeholder="2860\n2861\n2862")
+        
+        if st.button("Mark Fulfilled", type="primary"):
+            if not order_ids_input.strip():
+                st.warning("Please enter at least one Order ID.")
+            else:
+                import re
+                order_ids = [oid.strip() for oid in re.split(r'[,\n]+', order_ids_input) if oid.strip()]
+                
+                with st.spinner(f"Processing {len(order_ids)} orders..."):
+                    row_map, service = get_row_map()
+                    
+                    results = []
+                    sheet_updates_qr = []
+                    progress_bar = st.progress(0)
+                    
+                    for i, oid in enumerate(order_ids):
+                        s_order = get_shopify_order(oid, shopify_cfg["headers"], shopify_cfg["shop_url"])
+                        if s_order:
+                            success, msg = _shopify_fulfill(oid, shopify_cfg)
+                            results.append({"Order ID": oid, "Status": "✅ Success" if success else "⚠️ Failed", "Message": msg})
+                            
+                            if success and service and oid in row_map:
+                                sheet_updates_qr.append({
+                                    "row": row_map[oid],
+                                    "source": "Manual",
+                                    "status": "Fulfilled"
+                                })
+                        else:
+                            results.append({"Order ID": oid, "Status": "❌ Error", "Message": "Not found on Shopify"})
+                        
+                        progress_bar.progress((i + 1) / len(order_ids))
+                    
+                    if sheet_updates_qr and service:
+                        try:
+                            update_sheet_remarks(service, SHEET_ID, sheet_updates_qr)
+                            st.success(f"✅ Updated {len(sheet_updates_qr)} rows in Google Sheet (Q/R columns).")
+                        except Exception as e:
+                            st.warning(f"Sheet update failed: {e}")
+                    
+                    st.success("✅ Done!")
+                    st.dataframe(pd.DataFrame(results), width='stretch', hide_index=True)
+
+    with tab2:
+        st.subheader("Bulk Add or Update Tracking Information")
+        st.write("Excel se data copy-paste karein. Format: **Order ID [Tab/Comma] Tracking ID [Tab/Comma] Carrier** (Har order nayi line mein)")
+        bulk_tracking_input = st.text_area("Paste Data Here", height=200, key="tab2_bulk", placeholder="2860\t123456789\tDelhivery\n2861\t987654321\tAmazon")
+        
+        if st.button("Bulk Fulfill & Add Tracking", type="primary"):
+            if not bulk_tracking_input.strip():
+                st.warning("Please paste some data.")
+            else:
+                lines = bulk_tracking_input.strip().split("\n")
+                parsed_data = []
+                for line in lines:
+                    parts = [p.strip() for p in line.split("\t") if p.strip()]
+                    if len(parts) < 3:
+                        parts = [p.strip() for p in line.split(",") if p.strip()]
+                    
+                    if len(parts) >= 3:
+                        parsed_data.append({
+                            "order_id": parts[0],
+                            "tracking_id": parts[1],
+                            "carrier": parts[2]
+                        })
+                
+                if not parsed_data:
+                    st.error("Sahi format mein data nahi mila. Make sure format is: Order ID, Tracking ID, Carrier")
+                else:
+                    with st.spinner(f"Processing {len(parsed_data)} tracking updates..."):
+                        row_map, service = get_row_map()
+                        
+                        results = []
+                        sheet_updates_qr = []
+                        sheet_updates_st = []
+                        progress_bar = st.progress(0)
+                        
+                        for i, item in enumerate(parsed_data):
+                            oid = item["order_id"]
+                            tid = item["tracking_id"]
+                            car = item["carrier"]
+                            
+                            s_order = get_shopify_order(oid, shopify_cfg["headers"], shopify_cfg["shop_url"])
+                            if s_order:
+                                t_info = {"number": tid, "company": car, "url": ""}
+                                success, msg = _shopify_fulfill(oid, shopify_cfg, tracking_info=t_info)
+                                results.append({"Order ID": oid, "Tracking": tid, "Carrier": car, "Status": "✅ Success" if success else "⚠️ Failed", "Message": msg})
+                                
+                                if success and service and oid in row_map:
+                                    row_num = row_map[oid]
+                                    sheet_updates_qr.append({
+                                        "row": row_num,
+                                        "source": car,
+                                        "status": "Fulfilled"
+                                    })
+                                    sheet_updates_st.append({
+                                        "row": row_num,
+                                        "carrier": car,
+                                        "tracking_no": tid,
+                                        "url": "",
+                                        "remark": "Manual Update"
+                                    })
+                            else:
+                                results.append({"Order ID": oid, "Tracking": tid, "Carrier": car, "Status": "❌ Error", "Message": "Not found on Shopify"})
+                            
+                            progress_bar.progress((i + 1) / len(parsed_data))
+                        
+                        if service:
+                            if sheet_updates_qr:
+                                try:
+                                    update_sheet_remarks(service, SHEET_ID, sheet_updates_qr)
+                                except Exception as e:
+                                    st.warning(f"Sheet Q/R update failed: {e}")
+                            if sheet_updates_st:
+                                try:
+                                    update_sheet_tracking(service, SHEET_ID, sheet_updates_st)
+                                    st.success(f"✅ Updated {len(sheet_updates_st)} rows in Google Sheet (Q/R/S/T columns).")
+                                except Exception as e:
+                                    st.warning(f"Sheet S/T update failed: {e}")
+                        
+                        st.success("✅ Done!")
+                        st.dataframe(pd.DataFrame(results), width='stretch', hide_index=True)
 
 # ─────────────────────────────────────────────
 # ROUTER
@@ -1124,5 +1300,7 @@ elif page == "Reports":
     page_reports()
 elif page == "Sync":
     page_sync()
+elif page == "Shopify Tools":
+    page_shopify_tools()
 else:
     page_dashboard()

@@ -344,21 +344,22 @@ def create_mcf_order(token, order_data):
         "items": order_data.get("items", []),
     }
 
+    # India MCF API requires codSettings for ALL orders.
+    # For COD: isCodRequired=True with order amount
+    # For Prepaid: isCodRequired=False with zero charge
+    # All item values must be in perUnitDeclaredValue in items array.
     if is_cod:
         payload["codSettings"] = {
             "isCodRequired": True,
             "codCharge": {"currencyCode": "INR", "value": str(order_data.get("amount", "0"))},
         }
-    else:
-        # FBA India Prepaid orders workaround
-        payment_info = order_data.get("payment_info")
-        if not payment_info:
-            payment_info = [{
-                "PaymentMethod": "Prepaid",
-                "PaymentAmount": float(order_data.get("amount", 0)),
-                "CurrencyCode": "INR"
-            }]
-        payload["paymentInformationList"] = payment_info
+    pi = order_data.get("paymentInformationList")
+    if pi:  # list non-empty
+        payload["paymentInformationList"] = pi
+
+    import json
+    with open("payload_debug.json", "w") as f:
+        json.dump(payload, f, indent=2)
 
     try:
         r = requests.post(MCF_API_URL, headers=headers, json=payload, verify=False, timeout=30)

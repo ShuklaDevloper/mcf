@@ -1,0 +1,206 @@
+{
+  "asin": "B0DQLCVKGM",
+  "marketplace_id": "A21TJRUUN4KGV",
+  "catalog_asin": "B0DQLCVKGM",
+  "pricing_asin": "B0DQLCVKGM",
+  "summary": {
+    "list_price": null,
+    "effective_price": 463.0,
+    "buybox_price": 463.0,
+    "reference_price": 549.0,
+    "has_deal": false,
+    "discount_pct": null,
+    "reference_discount_pct": 15.66,
+    "deal_type": "INFERRED_PRICE_DROP",
+    "deal_reason": "Current effective price is lower than other visible offer price.",
+    "deal_confidence": "medium"
+  },
+  "catalog": {
+    "asin": "B0DQLCVKGM",
+    "summaries": [
+      {
+        "marketplaceId": "A21TJRUUN4KGV",
+        "adultProduct": false,
+        "autographed": false,
+        "brand": "Wonder Care",
+        "browseClassification": {
+          "displayName": "Ankle Braces",
+          "classificationId": "4264034031"
+        },
+        "color": "Blue",
+        "itemClassification": "BASE_PRODUCT",
+        "itemName": "Wonder Care Ankle Support Band for Heel Pain Relief, Ankle Brace For Men/Women, Ankle Binder for Foot Support, Pain Relief, Ankle Belt/Cap Foot Support for Pain Relief (Blue, 2pcs)",
+        "manufacturer": "Wonder Care",
+        "memorabilia": false,
+        "modelNumber": "WC_Ankle_Brace_Blue",
+        "partNumber": "WC_Ankle_Brace_Blue",
+        "size": "One Size",
+        "tradeInEligible": false,
+        "websiteDisplayGroup": "biss_basic_display_on_website",
+        "websiteDisplayGroupName": "BISS Basic"
+      }
+    ]
+  },
+  "pricing": {
+    "payload": {
+      "ASIN": "B0DQLCVKGM",
+      "status": "Success",
+      "ItemCondition": "New",
+      "Identifier": {
+        "MarketplaceId": "A21TJRUUN4KGV",
+        "ItemCondition": "New",
+        "ASIN": "B0DQLCVKGM"
+      },
+      "Summary": {
+        "LowestPrices": [
+          {
+            "condition": "new",
+            "fulfillmentChannel": "Amazon",
+            "LandedPrice": {
+              "CurrencyCode": "INR",
+              "Amount": 463.0
+            },
+            "ListingPrice": {
+              "CurrencyCode": "INR",
+              "Amount": 463.0
+            },
+            "Shipping": {
+              "CurrencyCode": "INR",
+              "Amount": 0.0
+            }
+          },
+          {
+            "condition": "new",
+            "fulfillmentChannel": "Merchant",
+            "LandedPrice": {
+              "CurrencyCode": "INR",
+              "Amount": 549.0
+            },
+            "ListingPrice": {
+              "CurrencyCode": "INR",
+              "Amount": 549.0
+            },
+            "Shipping": {
+              "CurrencyCode": "INR",
+              "Amount": 0.0
+            }
+          }
+        ],
+        "BuyBoxPrices": [
+          {
+            "condition": "New",
+            "LandedPrice": {
+              "CurrencyCode": "INR",
+              "Amount": 463.0
+            },
+            "ListingPrice": {
+              "CurrencyCode": "INR",
+              "Amount": 463.0
+            },
+            "Shipping": {
+              "CurrencyCode": "INR",
+              "Amount": 0.0
+            }
+          }
+        ],
+        "NumberOfOffers": [
+          {
+            "condition": "new",
+            "fulfillmentChannel": "Amazon",
+            "OfferCount": 1
+          },
+          {
+            "condition": "new",
+            "fulfillmentChannel": "Merchant",
+            "OfferCount": 1
+          }
+        ],
+        "BuyBoxEligibleOffers": [
+          {
+            "condition": "new",
+            "fulfillmentChannel": "Amazon",
+            "OfferCount": 1
+          },
+          {
+            "condition": "new",
+            "fulfillmentChannel": "Merchant",
+            "OfferCount": 1
+          }
+        ],
+        "SalesRankings": [
+          {
+            "ProductCategoryId": "health_and_beauty_display_on_website",
+            "Rank": 11809
+          },
+          {
+            "ProductCategoryId": "4264034031",
+            "Rank": 30
+          }
+        ],
+        "TotalOfferCount": 2
+      },
+      "Offers": [
+        {
+          "Shipping": {
+            "CurrencyCode": "INR",
+            "Amount": 0.0
+          },
+          "ListingPrice": {
+            "CurrencyCode": "INR",
+            "Amount": 463.0
+          },
+          "ShippingTime": {
+            "maximumHours": 0,
+            "minimumHours": 0,
+            "availabilityType": "NOW"
+          },
+          "SellerFeedbackRating": {
+            "FeedbackCount": 977,
+            "SellerPositiveFeedbackRating": 76.0
+          },
+          "PrimeInformation": {
+            "IsPrime": true,
+            "IsNationalPrime": true
+          },
+          "SubCondition": "new",
+          "SellerId": "A3CNF0WYEFIWGQ",
+          "IsFeaturedMerchant": true,
+          "IsBuyBoxWinner": true,
+          "IsFulfilledByAmazon": true
+        },
+        {
+          "Shipping": {
+            "CurrencyCode": "INR",
+            "Amount": 0.0
+          },
+          "ListingPrice": {
+            "CurrencyCode": "INR",
+            "Amount": 549.0
+          },
+          "ShippingTime": {
+            "maximumHours": 24,
+            "minimumHours": 24,
+            "availabilityType": "NOW"
+          },
+          "SellerFeedbackRating": {
+            "FeedbackCount": 977,
+            "SellerPositiveFeedbackRating": 76.0
+          },
+          "ShipsFrom": {
+            "Country": "IN"
+          },
+          "PrimeInformation": {
+            "IsPrime": false,
+            "IsNationalPrime": false
+          },
+          "SubCondition": "new",
+          "SellerId": "A3CNF0WYEFIWGQ",
+          "IsFeaturedMerchant": true,
+          "IsBuyBoxWinner": false,
+          "IsFulfilledByAmazon": false
+        }
+      ],
+      "marketplaceId": "A21TJRUUN4KGV"
+    }
+  }
+}
