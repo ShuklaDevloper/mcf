@@ -34,8 +34,14 @@ def read_secret(file_name="secret.txt"):
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
                 for line in f:
-                    if "=" in line and not line.strip().startswith("#"):
-                        k, v = line.strip().split("=", 1)
+                    line_str = line.strip()
+                    if line_str.startswith("#"):
+                        continue
+                    if ":" in line_str and "=" not in line_str:
+                        k, v = line_str.split(":", 1)
+                        secrets[k.strip()] = v.strip()
+                    elif "=" in line_str:
+                        k, v = line_str.split("=", 1)
                         secrets[k.strip()] = v.strip()
     except Exception as e:
         print(f"[utils] secret.txt read error: {e}")
@@ -438,25 +444,29 @@ def get_delhivery_tracking(api_key, order_id):
     Tries ref_ids, then #ref_ids as fallback.
     Returns (found: bool, awb: str, status: str, error: str)
     """
+    keys = api_key if isinstance(api_key, list) else [api_key]
     base = "https://track.delhivery.com/api/v1/packages/json/"
-    headers = {"Authorization": f"Token {api_key}"}
     clean_id = str(order_id).replace("#", "").strip()
 
-    for ref in [clean_id, f"#{clean_id}"]:
-        try:
-            r = requests.get(base, headers=headers, params={"ref_ids": ref}, timeout=15)
-            data = r.json()
-            shipments = data.get("ShipmentData", [])
-            if shipments:
-                s = shipments[0].get("Shipment", {})
-                awb = s.get("AWB", "")
-                status = s.get("Status", {}).get("Status", "")
-                if awb:
-                    return True, awb, status, ""
-        except Exception as e:
-            return False, "", "", str(e)
+    last_err = "Not found on Delhivery"
+    for key in keys:
+        if not key: continue
+        headers = {"Authorization": f"Token {key}"}
+        for ref in [clean_id, f"#{clean_id}"]:
+            try:
+                r = requests.get(base, headers=headers, params={"ref_ids": ref}, timeout=15)
+                data = r.json()
+                shipments = data.get("ShipmentData", [])
+                if shipments:
+                    s = shipments[0].get("Shipment", {})
+                    awb = s.get("AWB", "")
+                    status = s.get("Status", {}).get("Status", "")
+                    if awb:
+                        return True, awb, status, ""
+            except Exception as e:
+                last_err = str(e)
 
-    return False, "", "", "Not found on Delhivery"
+    return False, "", "", last_err
 
 
 # ─────────────────────────────────────────────
@@ -466,6 +476,8 @@ def create_delhivery_order(api_key, order_data, pickup_location="emaar"):
     """Submit a shipment to Delhivery.
     Returns (success: bool, response_data: dict, error_msg: str)
     """
+    keys = api_key if isinstance(api_key, list) else [api_key]
+    
     is_cod = "cod" in str(order_data.get("is_cod", "")).lower()
     shipment = {
         "name": order_data.get("customer", ""),
@@ -490,20 +502,32 @@ def create_delhivery_order(api_key, order_data, pickup_location="emaar"):
         "shipments": [shipment],
         "pickup_location": {"name": pickup_location},
     }
-    try:
-        r = requests.post(
-            "https://track.delhivery.com/api/cmu/create.json",
-            headers={"Authorization": f"Token {api_key}", "Content-Type": "application/json"},
-            data={"data": json.dumps(payload)},
-            timeout=30,
-        )
-        resp = r.json() if r.status_code in [200, 201] else {}
-        if r.status_code in [200, 201]:
-            pkgs = resp.get("packages", [])
-            if pkgs and pkgs[0].get("waybill"):
-                return True, resp, ""
-            remarks = pkgs[0].get("remarks", ["Unknown"]) if pkgs else ["Unknown"]
-            return False, resp, str(remarks)
-        return False, {}, f"HTTP {r.status_code}: {r.text[:200]}"
-    except Exception as e:
-        return False, {}, str(e)
+    
+    last_err = ""
+    last_resp = {}
+    
+    for key in keys:
+        if not key: continue
+        try:
+            r = requests.post(
+                "https://track.delhivery.com/api/cmu/create.json",
+                headers={"Authorization": f"Token {key}", "Content-Type": "application/json"},
+                data={"data": json.dumps(payload)},
+                timeout=30,
+            )
+            resp = r.json() if r.status_code in [200, 201] else {}
+            if r.status_code in [200, 201]:
+                pkgs = resp.get("packages", [])
+                if pkgs and pkgs[0].get("waybill"):
+                    return True, resp, ""
+                remarks = pkgs[0].get("remarks", ["Unknown"]) if pkgs else ["Unknown"]
+                last_err = str(remarks)
+                last_resp = resp
+            else:
+                last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+                last_resp = {}
+        except Exception as e:
+            last_err = str(e)
+            last_resp = {}
+
+    return False, last_resp, last_err

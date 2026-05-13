@@ -6,3 +6,6 @@ google-auth
 schedule
 openpyxl
 urllib3
+reportlab
+gspread
+python-barcode

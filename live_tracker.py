@@ -1,6 +1,7 @@
 import os
 import requests
 import json
+import time
 from datetime import datetime
 
 from utils import init_sheets_service, read_secret, SHEET_ID
@@ -22,6 +23,11 @@ SWISHIP_HEADERS = {
     "Referer": "https://www.swiship.co.uk",
     "User-Agent": "Mozilla/5.0"
 }
+
+def safe_date(val):
+    if not val:
+        return ""
+    return str(val)[:10]
 
 def format_dt(value):
     if not value:
@@ -53,14 +59,106 @@ def col_num_to_a1(col_num):
         result = chr(65 + rem) + result
     return result
 
+# ─── ITHINK LOGISTICS API ─────────────────────────────────────────────
+def get_ithink_shipment(awb, ithink_token, ithink_secret):
+    if not ithink_token or not ithink_secret:
+        return None
+    url = "https://api.ithinklogistics.com/api_v3/order/track.json"
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "data": {
+            "awb_number_list": str(awb).strip(),
+            "access_token": ithink_token,
+            "secret_key": ithink_secret
+        }
+    }
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=15)
+        if r.status_code == 200:
+            j = r.json()
+            if str(j.get("status", "")).strip().lower() == "success":
+                data = j.get("data", {})
+                if str(awb).strip() in data:
+                    return data[str(awb).strip()]
+    except Exception as e:
+        pass
+    return None
+
+def parse_ithink_datetime(dt_str):
+    if not dt_str:
+        return ""
+    try:
+        return datetime.strptime(str(dt_str)[:11].strip(), "%d %b %Y").strftime("%Y-%m-%d")
+    except Exception:
+        return str(dt_str)[:10]
+
+def parse_ithink(order):
+    if not order:
+        return None
+
+    status = str(order.get("current_status", ""))
+    last_scan = order.get("last_scan_details", {}) or {}
+    location = str(last_scan.get("scan_location", ""))
+    remark = str(last_scan.get("remark", ""))
+    
+    combined = (status + " " + remark).upper()
+
+    eta = order.get('expected_delivery_date', '') or order.get('promise_delivery_date', '')
+    if eta:
+        eta = parse_ithink_datetime(eta)
+
+    delivery_date = ""
+    if "DELIVERED" in status.upper() or "DELIVERED" in combined:
+        delivery_date = str(last_scan.get("status_date_time", ""))
+
+    pickup_date = ""
+    scan_details = order.get("scan_details", [])
+    for event in scan_details:
+        ev_status = str(event.get('status', '')).lower()
+        ev_remark = str(event.get('status_remark', '')).lower()
+        event_date = event.get('status_date_time', '')
+        if any(keyword in ev_status + " " + ev_remark for keyword in ['picked', 'pickup', 'dispatched', 'booked', 'manifested']):
+            pickup_date = str(event_date)
+            break
+
+    if not pickup_date:
+        pickup_date = str(order.get('order_date_time', ''))
+
+    if "DELIVERED" in combined and "RTO" not in combined and "RETURN" not in combined:
+        final_v = "Delivered"
+    elif "RTO" in combined or "RETURN" in combined:
+        final_v = "RTO"
+    elif "UNDELIVERED" in combined or "FAILED" in combined or "NDR" in combined:
+        final_v = "Undelivered"
+    else:
+        final_v = "Intransit"
+
+    parts = [p for p in [status, remark, location] if p]
+    last_update = " | ".join(parts)
+
+    return {
+        "status": final_v,
+        "eta": format_dt(eta) if eta else "",
+        "pickup": format_dt(pickup_date) if pickup_date else "",
+        "delivery": format_dt(delivery_date) if delivery_date else "",
+        "last_update": last_update,
+        "rto": final_v if final_v == "RTO" else "",
+    }
+
 def run_live_tracking_update(progress_callback=None):
     """
     Downloads Sheet via API, checks tracking for all MCF/Delhivery rows,
-    updates sheet locally and flushes to remote.
+    updates sheet locally and flushes to remote in chunks.
     Returns: list of dicts with summary results.
     """
     secrets = read_secret()
-    delhivery_api_key = secrets.get("DELHIVERY_API_KEY", "")
+    delhivery_keys = [
+        secrets.get("DELHIVERY_API_KEY", ""),
+        secrets.get("DELHIVERY_API_KEY2", "")
+    ]
+    delhivery_keys = [k for k in delhivery_keys if k]
+    ithink_token = secrets.get("Ithink_access_token", "")
+    ithink_secret = secrets.get("Ithink_secret_key", "")
 
     try:
         service = init_sheets_service()
@@ -68,9 +166,12 @@ def run_live_tracking_update(progress_callback=None):
         return [{"order_id": "Error", "status": f"Sheets service init failed: {str(e)}", "carrier": "", "desc": ""}]
 
     # Fetch rows
-    range_name = 'Sheet1!A:W'
-    result = service.spreadsheets().values().get(spreadsheetId=SHEET_ID, range=range_name).execute()
-    rows = result.get('values', [])
+    range_name = 'Sheet1!A:AF'
+    try:
+        result = service.spreadsheets().values().get(spreadsheetId=SHEET_ID, range=range_name).execute()
+        rows = result.get('values', [])
+    except Exception as e:
+         return [{"order_id": "Error", "status": f"Sheets service fetch failed: {str(e)}", "carrier": "", "desc": ""}]
 
     if len(rows) <= 1:
         return []
@@ -92,7 +193,7 @@ def run_live_tracking_update(progress_callback=None):
     carrier_idx = get_idx("carrier")
     eta_idx = get_idx("eta")
     pickup_idx = get_idx("pickup date")
-    delivery_idx = get_idx("delivery date", "deliverydate")
+    delivery_idx = get_idx("delivery date", "deliverydate", "delevrey date")
     last_status_idx = get_idx("last status", "last update", "last_update")
     rto_idx = get_idx("rto")
 
@@ -102,7 +203,6 @@ def run_live_tracking_update(progress_callback=None):
     pending_updates = []
     summary_results = []
     
-    # Pre-calculated 1-based column indices for A1 notation
     col_tracking_url = (tracking_url_idx + 1) if tracking_url_idx != -1 else 20
     col_status = (status_idx + 1) if status_idx != -1 else 21
     
@@ -119,32 +219,54 @@ def run_live_tracking_update(progress_callback=None):
         tracking_no = safe_get(tracking_no_idx)
         carrier = safe_get(carrier_idx)
         existing_rto = safe_get(rto_idx)
+        existing_status = safe_get(status_idx)
         order_id = safe_get(order_id_idx).replace("#", "")
 
         is_mcf = source.upper() == "MCF"
         is_delhivery = "delhivery" in carrier.lower()
+        is_ithink = "ithink" in carrier.lower()
 
-        if tracking_no and (is_mcf or is_delhivery):
+        if tracking_no:
+            # Skip if already delivered or RTO is delivered
+            if existing_status.lower() == "delivered":
+                continue
+            if existing_status.lower() == "rto" and existing_rto.lower() == "delivered":
+                continue
             if existing_rto.lower() == "delivered":
-                continue # Already at end state
+                continue
             
             orders_to_check.append({
                 "row_index": i,
                 "order_id": order_id,
                 "tracking_no": tracking_no,
                 "carrier": carrier,
-                "existing_rto": existing_rto
+                "existing_rto": existing_rto,
+                "existing_status": existing_status
             })
 
     total = len(orders_to_check)
+    print(f"\n[INFO] Found {total} orders to check tracking for...")
     if total == 0:
         return []
+
+    def flush_updates(updates):
+        if not updates: return
+        try:
+            # Re-init service to avoid ConnectionAbortedError
+            srv = init_sheets_service()
+            srv.spreadsheets().values().batchUpdate(
+                spreadsheetId=SHEET_ID,
+                body={"valueInputOption": "RAW", "data": updates}
+            ).execute()
+        except Exception as e:
+            print(f"Batch update error: {e}")
 
     for idx, item in enumerate(orders_to_check):
         order_id = item["order_id"]
         tracking_no = item["tracking_no"]
         carrier = item["carrier"]
         existing_rto = item["existing_rto"]
+        existing_status = item["existing_status"]
         row_num = item["row_index"] + 1
 
         if progress_callback:
@@ -152,43 +274,77 @@ def run_live_tracking_update(progress_callback=None):
 
         eta_value, pickup_value, delivery_value = "", "", ""
         last_update_value, rto_value, tracking_url = "", "", ""
+        status = existing_status or "Intransit"
+        info = None
+        low_carrier = carrier.lower()
 
         try:
-            if "delhivery" in carrier.lower() and delhivery_api_key:
-                resp = requests.get(DELHIVERY_URL, params={"waybill": tracking_no, "token": delhivery_api_key}, timeout=15)
-                if resp.status_code == 200:
-                    try:
-                        res = resp.json()
-                        shipment_data = res.get("ShipmentData", [])
-                        shipment = shipment_data[0].get("Shipment", {}) if shipment_data else {}
-                        status_obj = shipment.get("Status", {})
-                        
-                        raw_state = status_obj.get("Status", "")
-                        raw_event = status_obj.get("Instructions", "")
-                        raw_date = status_obj.get("StatusDateTime", "") or status_obj.get("StatusDate", "")
-                        status = normalize_status(raw_state, raw_event)
-                        tracking_url = f"https://www.delhivery.com/track-v2/package/{tracking_no}"
+            if delhivery_keys and not info:
+                for del_key in delhivery_keys:
+                    resp = requests.get(DELHIVERY_URL, params={"waybill": tracking_no, "token": del_key}, timeout=15)
+                    if resp.status_code == 200:
+                        try:
+                            res = resp.json()
+                            shipment_data = res.get("ShipmentData", [])
+                            shipment = shipment_data[0].get("Shipment", {}) if shipment_data else {}
+                            
+                            if shipment:
+                                status_obj = shipment.get("Status", {})
+                                raw_state = status_obj.get("Status", "")
+                                raw_event = status_obj.get("Instructions", "")
+                                raw_date = status_obj.get("StatusDateTime", "") or status_obj.get("StatusDate", "")
+                                location = status_obj.get("StatusLocation", "")
+                                
+                                combined = f"{raw_state} {raw_event}".upper()
+                                if "DELIVERED" in combined and "RTO" not in combined and "RETURN" not in combined:
+                                    status = "Delivered"
+                                elif "RTO" in combined or "RETURN" in combined:
+                                    status = "RTO"
+                                elif "UNDELIVERED" in combined or "FAILED" in combined or "NDR" in combined:
+                                    status = "Undelivered"
+                                else:
+                                    status = "Intransit"
+                                
+                            tracking_url = f"https://www.delhivery.com/track-v2/package/{tracking_no}"
 
-                        eta_value = format_dt(shipment.get("ExpectedDeliveryDate", "") or shipment.get("EDD", ""))
-                        pickup_value = format_dt(shipment.get("PickUpDate", "") or shipment.get("PickupDate", ""))
-                        last_update_value = f"{raw_state} {raw_event}".strip()
-                        if raw_date:
-                            last_update_value = f"{last_update_value} | {format_dt(raw_date)}".strip(" |")
+                            eta_value = format_dt(shipment.get("ExpectedDeliveryDate", "") or shipment.get("EDD", ""))
+                            pickup_value = format_dt(shipment.get("PickUpDate", "") or shipment.get("PickupDate", ""))
+                            last_update_value = f"{raw_state} | {raw_event} | {location}".strip(" |")
 
-                        if status == "Delivered":
-                            delivery_value = format_dt(shipment.get("DeliveryDate", "") or raw_date)
+                            if status == "Delivered":
+                                delivery_value = format_dt(shipment.get("DeliveryDate", "") or raw_date)
+                                if not delivery_value:
+                                    for scan in (shipment.get("Scans", []) or []):
+                                        sd = scan.get("ScanDetail") or {}
+                                        if "DELIVERED" in (sd.get("Scan") or "").upper():
+                                            delivery_value = format_dt(sd.get("ScanDateTime", ""))
 
-                        rto_tracking_active = ("rto" in existing_rto.lower()) or ("return" in existing_rto.lower())
-                        current_text = f"{raw_state} {raw_event}".lower()
-                        if status == "RTO" or "rto" in current_text or "return" in current_text:
-                            rto_value = last_update_value or "RTO Intransit"
-                        elif rto_tracking_active and status == "Delivered":
-                            rto_value = "Delivered"
+                            rto_tracking_active = ("rto" in existing_rto.lower()) or ("return" in existing_rto.lower())
+                            if status == "RTO":
+                                rto_value = last_update_value or "RTO Intransit"
+                            elif rto_tracking_active and status == "Delivered":
+                                rto_value = "Delivered"
+                                
+                            info = True
                     except Exception:
-                        status = "Intransit"
-                else:
-                    status = "Intransit"
-            else:
+                        pass
+                        
+            if not info:
+                # iThink fallback
+                ithink_order = get_ithink_shipment(tracking_no, ithink_token, ithink_secret)
+                if ithink_order:
+                    pinfo = parse_ithink(ithink_order)
+                    if pinfo:
+                        status = pinfo["status"]
+                        eta_value = pinfo["eta"]
+                        pickup_value = pinfo["pickup"]
+                        delivery_value = pinfo["delivery"]
+                        last_update_value = pinfo["last_update"]
+                        rto_value = pinfo["rto"]
+                        tracking_url = f"https://ithinklogistics.com/track/{tracking_no}" # Generic
+                        info = True
+
+            if not info:
                 # Swiship / Amazon 
                 payload = {"trackingNumber": tracking_no, "shipMethod": "ATS_STANDARD"}
                 resp = requests.post(SWISHIP_URL, headers=SWISHIP_HEADERS, cookies=COOKIES, json=payload, timeout=10)
@@ -220,25 +376,37 @@ def run_live_tracking_update(progress_callback=None):
                         elif existing_rto and existing_rto.lower() != "delivered" and status == "Delivered":
                             rto_value = "Delivered"
                         
+                        info = True
                     except Exception:
-                        status = "Intransit"
-                else:
-                    status = "Intransit"
-
-            if status not in {"Delivered", "RTO", "Intransit", "Lost"}:
+                        pass
+                        
+            # MCF SP-API Fallback
+            if not info:
+                from utils import get_access_token
+                from w import fetch_mcf_data
+                token, _ = get_access_token(secrets)
+                if token:
+                    tn, cc, mcf_status, raw = fetch_mcf_data(tracking_no, token)
+                    if mcf_status and mcf_status != "NotFound":
+                        status = mcf_status
+                        carrier = cc or "MCF"
+                        tracking_url = f"Tracking: {tn}" if tn else ""
+                        info = True
+                        
+            if info and status not in {"Delivered", "RTO", "Intransit", "Lost", "Undelivered"}:
                 status = "Intransit"
                 
         except Exception:
-            status = "Intransit"
+            status = existing_status or "Intransit"
 
         # Push to batch payload
-        pending_updates.append({"range": f"{col_num_to_a1(col_tracking_url)}{row_num}", "values": [[tracking_url]]})
+        if tracking_url: pending_updates.append({"range": f"{col_num_to_a1(col_tracking_url)}{row_num}", "values": [[tracking_url]]})
         pending_updates.append({"range": f"{col_num_to_a1(col_status)}{row_num}", "values": [[status]]})
-        if eta_idx != -1: pending_updates.append({"range": f"{col_num_to_a1(eta_idx + 1)}{row_num}", "values": [[eta_value]]})
-        if pickup_idx != -1: pending_updates.append({"range": f"{col_num_to_a1(pickup_idx + 1)}{row_num}", "values": [[pickup_value]]})
-        if delivery_idx != -1: pending_updates.append({"range": f"{col_num_to_a1(delivery_idx + 1)}{row_num}", "values": [[delivery_value]]})
-        if last_status_idx != -1: pending_updates.append({"range": f"{col_num_to_a1(last_status_idx + 1)}{row_num}", "values": [[last_update_value]]})
-        if rto_idx != -1: pending_updates.append({"range": f"{col_num_to_a1(rto_idx + 1)}{row_num}", "values": [[rto_value]]})
+        if eta_idx != -1 and eta_value: pending_updates.append({"range": f"{col_num_to_a1(eta_idx + 1)}{row_num}", "values": [[eta_value]]})
+        if pickup_idx != -1 and pickup_value: pending_updates.append({"range": f"{col_num_to_a1(pickup_idx + 1)}{row_num}", "values": [[pickup_value]]})
+        if delivery_idx != -1 and delivery_value: pending_updates.append({"range": f"{col_num_to_a1(delivery_idx + 1)}{row_num}", "values": [[delivery_value]]})
+        if last_status_idx != -1 and last_update_value: pending_updates.append({"range": f"{col_num_to_a1(last_status_idx + 1)}{row_num}", "values": [[last_update_value]]})
+        if rto_idx != -1 and rto_value: pending_updates.append({"range": f"{col_num_to_a1(rto_idx + 1)}{row_num}", "values": [[rto_value]]})
 
         summary_results.append({
             "Order ID": order_id,
@@ -250,10 +418,21 @@ def run_live_tracking_update(progress_callback=None):
             "RTO": rto_value
         })
 
-    if pending_updates:
-        service.spreadsheets().values().batchUpdate(
-            spreadsheetId=SHEET_ID,
-            body={"valueInputOption": "RAW", "data": pending_updates}
-        ).execute()
+        print(f"  [{idx+1}/{total}] Row {row_num} | T: {tracking_no} | Carrier: {carrier} | Status: {status}")
 
+        # Chunk updates to avoid connection drop
+        if len(pending_updates) >= 150:
+            flush_updates(pending_updates)
+            pending_updates = []
+            time.sleep(1)
+
+    if pending_updates:
+        flush_updates(pending_updates)
+
+    print("\n[INFO] Live Tracking Update Finished.")
     return summary_results
+
+if __name__ == "__main__":
+    print("Starting Live Tracker (Terminal Mode)...")
+    res = run_live_tracking_update()
+    print(f"\n[DONE] Checked and updated tracking for {len(res)} items.")

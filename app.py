@@ -88,6 +88,7 @@ PAGES = {
     "📈 Reports": "Reports",
     "🔄 Sync": "Sync",
     "🛠️ Shopify Tools": "Shopify Tools",
+    "🏷️ Generate Labels": "Labels",
 }
 
 with st.sidebar:
@@ -587,9 +588,14 @@ def _process_orders(full_df, selected, mcf_sel, del_sel):
 
     # ── DELHIVERY ────────────────────────────────────────────────────────
     if len(del_sel) > 0:
-        del_key = secrets.get("DELHIVERY_API_KEY", "")
-        if not del_key:
-            st.error("DELHIVERY_API_KEY missing in secret.txt")
+        del_keys = [
+            secrets.get("DELHIVERY_API_KEY", ""),
+            secrets.get("DELHIVERY_API_KEY2", "")
+        ]
+        del_keys = [k for k in del_keys if k]
+        
+        if not del_keys:
+            st.error("DELHIVERY_API_KEY missing in secret.txt or secrets")
         else:
             for _, row in del_sel.iterrows():
                 order_id = row["order_id"]
@@ -611,7 +617,7 @@ def _process_orders(full_df, selected, mcf_sel, del_sel):
 
                 order_data = dict(row) | {"total_qty": int(row["qty"])}
                 success, resp, err = create_delhivery_order(
-                    del_key, order_data,
+                    del_keys, order_data,
                     pickup_location=st.session_state.get("pickup_loc", "emaar")
                 )
 
@@ -1287,6 +1293,80 @@ def page_shopify_tools():
                         st.dataframe(pd.DataFrame(results), width='stretch', hide_index=True)
 
 # ─────────────────────────────────────────────
+# PAGE 7: LABELS
+# ─────────────────────────────────────────────
+def page_labels():
+    st.title("🏷️ Generate Labels & Update Sheet")
+    st.markdown("Paste data in format: **Order ID [Tab/Space] Tracking ID (AWB) [Tab/Space] SKU [Tab/Space] Title (Optional)**")
+    
+    input_data = st.text_area("Paste Data Here:", height=200, placeholder="5060\t52799210020160\tWC_Back_Rest_Black")
+    
+    if st.button("Update Sheet & Generate Labels", type="primary"):
+        if not input_data.strip():
+            st.warning("Please paste some data first.")
+            return
+            
+        with st.spinner("Processing labels and updating sheet..."):
+            import subprocess
+            import re
+            import os
+            import sys
+            
+            script_path = os.path.join(os.path.dirname(__file__), "update_sheet_awb.py")
+            
+            try:
+                # Add extra newline to simulate pressing Enter on empty line
+                input_str = input_data.strip() + "\n\n"
+                
+                # Run the script and feed the input text
+                process = subprocess.run(
+                    [sys.executable, script_path],
+                    input=input_str,
+                    text=True,
+                    capture_output=True,
+                    cwd=os.path.dirname(__file__)
+                )
+                
+                output = process.stdout
+                err_output = process.stderr
+                
+                # Show the textual output in an expander
+                with st.expander("Show Script Execution Logs"):
+                    st.text(output)
+                    if err_output:
+                        st.text("Errors:")
+                        st.text(err_output)
+                        
+                # Extract PDF path from the output
+                pdf_match = re.search(r"PDF saved:\s*(.*?\.pdf)", output)
+                if pdf_match:
+                    pdf_path = pdf_match.group(1).strip()
+                    import os
+                    if os.path.exists(pdf_path):
+                        st.success(f"✅ Labels Generated Successfully!")
+                        
+                        with open(pdf_path, "rb") as f:
+                            pdf_bytes = f.read()
+                            
+                        st.download_button(
+                            label="📥 Download Labels (PDF)",
+                            data=pdf_bytes,
+                            file_name=os.path.basename(pdf_path),
+                            mime="application/pdf",
+                            type="primary"
+                        )
+                    else:
+                        st.error(f"Generated PDF file not found at: {pdf_path}")
+                else:
+                    if "✅ Google Sheet successfully updated!" in output:
+                        st.warning("Google Sheet updated, but failed to find the generated PDF path in output.")
+                    else:
+                        st.error("Failed to process data. Check the logs above.")
+                        
+            except Exception as e:
+                st.error(f"Error running the script: {e}")
+
+# ─────────────────────────────────────────────
 # ROUTER
 # ─────────────────────────────────────────────
 page = st.session_state.page
@@ -1302,5 +1382,7 @@ elif page == "Sync":
     page_sync()
 elif page == "Shopify Tools":
     page_shopify_tools()
+elif page == "Labels":
+    page_labels()
 else:
     page_dashboard()
