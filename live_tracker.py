@@ -281,9 +281,9 @@ def run_live_tracking_update(progress_callback=None):
         try:
             if delhivery_keys and not info:
                 for del_key in delhivery_keys:
-                    resp = requests.get(DELHIVERY_URL, params={"waybill": tracking_no, "token": del_key}, timeout=15)
-                    if resp.status_code == 200:
-                        try:
+                    try:
+                        resp = requests.get(DELHIVERY_URL, params={"waybill": tracking_no, "token": del_key}, timeout=15)
+                        if resp.status_code == 200:
                             res = resp.json()
                             shipment_data = res.get("ShipmentData", [])
                             shipment = shipment_data[0].get("Shipment", {}) if shipment_data else {}
@@ -305,27 +305,27 @@ def run_live_tracking_update(progress_callback=None):
                                 else:
                                     status = "Intransit"
                                 
-                            tracking_url = f"https://www.delhivery.com/track-v2/package/{tracking_no}"
+                                tracking_url = f"https://www.delhivery.com/track-v2/package/{tracking_no}"
+                                eta_value = format_dt(shipment.get("ExpectedDeliveryDate", "") or shipment.get("EDD", ""))
+                                pickup_value = format_dt(shipment.get("PickUpDate", "") or shipment.get("PickupDate", ""))
+                                last_update_value = f"{raw_state} | {raw_event} | {location}".strip(" |")
 
-                            eta_value = format_dt(shipment.get("ExpectedDeliveryDate", "") or shipment.get("EDD", ""))
-                            pickup_value = format_dt(shipment.get("PickUpDate", "") or shipment.get("PickupDate", ""))
-                            last_update_value = f"{raw_state} | {raw_event} | {location}".strip(" |")
+                                if status == "Delivered":
+                                    delivery_value = format_dt(shipment.get("DeliveryDate", "") or raw_date)
+                                    if not delivery_value:
+                                        for scan in (shipment.get("Scans", []) or []):
+                                            sd = scan.get("ScanDetail") or {}
+                                            if "DELIVERED" in (sd.get("Scan") or "").upper():
+                                                delivery_value = format_dt(sd.get("ScanDateTime", ""))
 
-                            if status == "Delivered":
-                                delivery_value = format_dt(shipment.get("DeliveryDate", "") or raw_date)
-                                if not delivery_value:
-                                    for scan in (shipment.get("Scans", []) or []):
-                                        sd = scan.get("ScanDetail") or {}
-                                        if "DELIVERED" in (sd.get("Scan") or "").upper():
-                                            delivery_value = format_dt(sd.get("ScanDateTime", ""))
-
-                            rto_tracking_active = ("rto" in existing_rto.lower()) or ("return" in existing_rto.lower())
-                            if status == "RTO":
-                                rto_value = last_update_value or "RTO Intransit"
-                            elif rto_tracking_active and status == "Delivered":
-                                rto_value = "Delivered"
-                                
-                            info = True
+                                rto_tracking_active = ("rto" in existing_rto.lower()) or ("return" in existing_rto.lower())
+                                if status == "RTO":
+                                    rto_value = last_update_value or "RTO Intransit"
+                                elif rto_tracking_active and status == "Delivered":
+                                    rto_value = "Delivered"
+                                    
+                                info = True
+                                break  # Found data, stop trying other keys
                     except Exception:
                         pass
                         
