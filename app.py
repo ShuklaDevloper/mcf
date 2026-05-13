@@ -36,6 +36,15 @@ from w import fetch_mcf_data
 from live_tracker import run_live_tracking_update
 
 # ─────────────────────────────────────────────
+# MCF BLOCKED SKUs — these will NOT be sent to Amazon MCF
+# ─────────────────────────────────────────────
+MCF_BLOCKED_SKUS = {
+    "WC_Cervical_Pillow_White",
+    "WC_Back_Rest_Black",
+    "WC_Wedge_Pillow_Black",
+}
+
+# ─────────────────────────────────────────────
 # PAGE CONFIG
 # ─────────────────────────────────────────────
 st.set_page_config(
@@ -213,11 +222,22 @@ def fetch_endpoint_orders():
         is_err = "error" in str(fulfilled).lower() or "fail" in str(fulfilled).lower() or "error" in str(o.get("status", "")).lower()
         if state_code in ["UP", "UTTAR PRADESH", "DELHI", "NEW DELHI", "DL", "HARYANA", "HR"]:
             is_err = True
+
+        # Check if any SKU in this order is blocked from MCF
+        order_skus = [s.strip() for s in seller_sku.split(",") if s.strip()]
+        is_mcf_blocked = any(sku in MCF_BLOCKED_SKUS for sku in order_skus)
+        if is_mcf_blocked:
+            if not issue:
+                issue = f"MCF Blocked SKU"
+            row["issue"] = issue
+            is_err = True  # Treat as error so it won't be auto-selected
+
         if (not source and not fulfilled) or is_err:
             row["select"] = False if is_err else True
             row["is_error"] = is_err
             row["path"] = "MCF"
-            pending.append(row)
+            if not is_mcf_blocked:  # Don't add blocked SKU orders to MCF pending queue
+                pending.append(row)
         elif source:
             processed.append(row)
 
