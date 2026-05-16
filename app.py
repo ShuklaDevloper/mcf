@@ -308,37 +308,95 @@ def sheet_row_to_report_dict(row) -> dict:
         "total_amount": float(row.get("amount", 0) or 0),
         "created_at": created,
         "updated_at": created,
-        "row_number": int(row.get("row_number", 0) or 0),
+        "row_number": db.safe_row_number(row.get("row_number", 0)),
         "seller_sku": str(row.get("seller_sku", "")),
         "title": str(row.get("title", ""))[:200],
-        "qty": int(row.get("qty", 1) or 1),
+        "qty": db.safe_int_qty(row.get("qty", 1), 1),
         "is_cod": 1 if str(row.get("is_cod", "")).lower() in ("true", "yes", "1", "cod") else 0,
         "pincode": str(row.get("pincode", "")),
         "city": str(row.get("city", "")),
         "sheet_fulfilled": fulfilled,
+        "column_r": fulfilled,
         "source_channel": "SHOPIFY",
         "_data_source": "sheet",
     }
 
 
 def merge_db_and_sheet_reports(db_orders: list, sheet_report_rows: list) -> list:
-    """DB rows override sheet for same order_id (fulfillment trail wins)."""
+    """DB rows override sheet for same order_id; keep sheet column R for reporting."""
     by_oid = {}
     for r in sheet_report_rows:
         oid = str(r.get("order_id", "")).strip()
         if oid:
-            by_oid[oid] = dict(r)
+            row = dict(r)
+            row["column_r"] = str(row.get("sheet_fulfilled", row.get("column_r", "")) or "")
+            by_oid[oid] = row
     for r in db_orders:
         oid = str(r.get("order_id", "")).strip()
         if not oid:
             continue
+        prev = by_oid.get(oid)
         d = dict(r)
         d["_data_source"] = "db"
+        if prev:
+            d["column_r"] = str(prev.get("column_r", prev.get("sheet_fulfilled", "")) or "")
+        else:
+            d["column_r"] = str(d.get("sheet_fulfilled", "") or "")
         by_oid[oid] = d
     return list(by_oid.values())
 
 
-def apply_report_filters_python(rows, status_filter, channel_filter, date_from, date_to, search) -> list:
+def normalize_report_multiselect(selected: list, all_token: str = "All"):
+    """If user picks All + PROCESSING, ignore All and apply PROCESSING only."""
+    if not selected:
+        return None
+    specific = [x for x in selected if x != all_token]
+    if not specific:
+        return None
+    return specific
+
+
+def row_matches_column_r_filter(column_r_value, categories: list) -> bool:
+    """OR semantics: row passes if it matches any selected R category."""
+    if not categories:
+        return True
+    rv = str(column_r_value or "").strip()
+    rv_l = rv.lower()
+    for tag in categories:
+        if tag == "Blank R":
+            if not rv:
+                return True
+        elif tag == "Non-blank R":
+            if rv:
+                return True
+        elif tag == "FULFILLED (exact)":
+            if rv.upper() == "FULFILLED":
+                return True
+        elif tag == "Includes 'Planning'":
+            if "planning" in rv_l:
+                return True
+        elif tag == "Includes 'ful'":
+            if "ful" in rv_l:
+                return True
+        elif tag == "Includes 'MCF:'":
+            if "mcf:" in rv_l:
+                return True
+        elif tag == "Includes 'error' or 'fail'":
+            if "error" in rv_l or "fail" in rv_l:
+                return True
+    return False
+
+
+def apply_report_filters_python(
+    rows,
+    status_filter,
+    channel_filter,
+    date_from,
+    date_to,
+    search,
+    r_column_filter=None,
+    result_limit: int = 5000,
+) -> list:
     """Same rules as db.get_orders_filtered, for merged in-memory rows."""
     out = []
     for r in rows:
@@ -355,24 +413,29 @@ def apply_report_filters_python(rows, status_filter, channel_filter, date_from, 
             match = ("DELHIVERY" in allowed and ch == "DELHIVERY") or ("MCF" in allowed and ch == "MCF")
             if not match:
                 continue
+        if r_column_filter and not row_matches_column_r_filter(r.get("column_r", ""), r_column_filter):
+            continue
         if date_from or date_to:
             rd = _parse_row_date_for_filter(r.get("created_at") or r.get("updated_at"))
             if rd is None:
-                continue
-            if date_from and rd < date_from:
-                continue
-            if date_to and rd > date_to:
-                continue
+                if date_from:
+                    continue
+            else:
+                if date_from and rd < date_from:
+                    continue
+                if date_to and rd > date_to:
+                    continue
         if search:
             s = search.lower()
             oid = str(r.get("order_id", "")).lower()
             cname = str(r.get("customer_name", "")).lower()
             trk = str(r.get("tracking_number", "")).lower()
-            if s not in oid and s not in cname and s not in trk:
+            rcol = str(r.get("column_r", "")).lower()
+            if s not in oid and s not in cname and s not in trk and s not in rcol:
                 continue
         out.append(r)
     out.sort(key=lambda x: str(x.get("created_at") or x.get("updated_at") or ""), reverse=True)
-    return out[:1000]
+    return out[: int(result_limit)]
 
 
 def compute_sheet_dashboard_stats(pending: list, processed: list) -> dict:
@@ -1427,19 +1490,81 @@ def page_reports():
         fc1, fc2, fc3 = st.columns(3)
         with fc1:
             status_opts = ["All", "NEW", "PROCESSING", "SHIPPED", "DELIVERED", "FAILED"]
-            sel_status = st.multiselect("Status", status_opts, default=["All"])
+            sel_status = st.multiselect(
+                "Status",
+                status_opts,
+                default=["All"],
+                help="Agar **All** ke saath koi status chunein to sirf wahi statuses lagenge — `All` ignore ho jata hai.",
+            )
         with fc2:
             ch_opts = ["All", "MCF", "DELHIVERY"]
-            sel_channel = st.multiselect("Channel", ch_opts, default=["All"])
+            sel_channel = st.multiselect(
+                "Channel",
+                ch_opts,
+                default=["All"],
+                help="`All` + `MCF` = sirf MCF rows.",
+            )
         with fc3:
-            search = st.text_input("Search (Order ID / Customer / Tracking)")
+            search = st.text_input("Search (Order ID / Customer / Tracking / R)")
 
-        dc1, dc2 = st.columns(2)
-        date_from = dc1.date_input("From Date", value=None)
-        date_to = dc2.date_input("To Date", value=None)
+        dc1, dc2, dc3 = st.columns(3)
+        with dc1:
+            apply_from = st.checkbox(
+                "From date limit",
+                value=False,
+                key="rep_apply_from",
+                help="✓ = niche wali date se filter. **Bina ✓ = shuru se** (minimum limit nahi).",
+            )
+            date_from = st.date_input(
+                "From Date",
+                value=datetime.now().date().replace(day=1),
+                key="report_date_from",
+                disabled=not apply_from,
+                help="Sirf jab upar 'From date limit' tick ho.",
+            )
+        with dc2:
+            apply_to = st.checkbox(
+                "To date limit",
+                value=False,
+                key="rep_apply_to",
+                help="✓ = niche wali date tak filter. **Bina ✓ = koi end limit nahi**.",
+            )
+            date_to = st.date_input(
+                "To Date",
+                value=datetime.now().date(),
+                key="report_date_to",
+                disabled=not apply_to,
+                help="Sirf jab upar 'To date limit' tick ho.",
+            )
+        with dc3:
+            r_col_opts = [
+                "All",
+                "Blank R",
+                "Non-blank R",
+                "FULFILLED (exact)",
+                "Includes 'Planning'",
+                "Includes 'ful'",
+                "Includes 'MCF:'",
+                "Includes 'error' or 'fail'",
+            ]
+            sel_r = st.multiselect(
+                "Column R (fulfilled)",
+                r_col_opts,
+                default=["All"],
+                help="Sheet ka **R** — merged row mein sheet se aata hai. Ek se zyada = **OR** (koi bhi match).",
+            )
 
-    status_filter = None if "All" in sel_status or not sel_status else sel_status
-    channel_filter = None if "All" in sel_channel or not sel_channel else sel_channel
+        st.caption(
+            "**Dono dates:** Limit tabhi lagti hai jab **From date limit** / **To date limit** tick ho. "
+            "Checkbox **bina tick** = *shuru se* aur *koi end cap nahi*."
+        )
+
+    status_filter = normalize_report_multiselect(sel_status)
+    channel_filter = normalize_report_multiselect(sel_channel)
+    r_filter = normalize_report_multiselect(sel_r)
+
+    eff_from = date_from if apply_from else None
+    eff_to = date_to if apply_to else None
 
     p_df = st.session_state.pending_df
     r_df = st.session_state.processed_df
@@ -1457,11 +1582,20 @@ def page_reports():
     )
     merged = merge_db_and_sheet_reports(db_pool, sheet_reports)
     orders = apply_report_filters_python(
-        merged, status_filter, channel_filter, date_from, date_to, search or None,
+        merged,
+        status_filter,
+        channel_filter,
+        eff_from,
+        eff_to,
+        search or None,
+        r_column_filter=r_filter,
     )
 
     st.metric("Results", len(orders))
-    st.caption(f"Merged before filters: **{len(merged)}** rows (sheet + DB deduped).")
+    st.caption(
+        f"Merged before filters: **{len(merged)}** rows (sheet + DB deduped). "
+        f"Showing up to **5000** after filters."
+    )
 
     if orders:
         df = pd.DataFrame(orders)
@@ -1496,7 +1630,7 @@ def page_reports():
             )
         else:
             st.info(
-                f"Filters se koi row match nahi. (Merged total **{len(merged)}** — Status/Channel **All** ya dates khali karein.)"
+                f"Filters se koi row match nahi. (Merged **{len(merged)}** — Status/Channel/R ya dates adjust karein.)"
             )
 
 
@@ -1546,13 +1680,13 @@ def page_sync():
                             "is_cod": str(o.get("is_cod", "")),
                             "seller_sku": o.get("seller_sku", ""),
                             "title": o.get("title", "")[:200],
-                            "qty": (int(str(o.get("qty", 1)).strip()) if str(o.get("qty", "1")).strip().isdigit() else 1),
-                            "row_number": int(o.get("row_number", 0) or 0),
+                            "qty": db.safe_int_qty(o.get("qty", 1), 1),
+                            "row_number": db.safe_row_number(o.get("row_number", 0)),
                             "source_channel": "SHOPIFY",
                             "items": [{
                                 "seller_sku": o.get("seller_sku", ""),
                                 "title": o.get("title", ""),
-                                "quantity": int(o.get("qty", 1) or 1),
+                                "quantity": db.safe_int_qty(o.get("qty", 1), 1),
                                 "price": o.get("amount", 0),
                             }],
                         }
