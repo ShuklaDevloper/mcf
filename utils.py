@@ -183,6 +183,46 @@ def ensure_sheet_capacity(service, sheet_id, max_row_needed):
     except Exception as e:
         print("[utils] ensure_sheet_capacity error:", e)
 
+def infer_sheet_source_q(carrier: str, tracking_no: str = "") -> str:
+    """Map carrier + AWB to column Q (Source). Amazon / MCF logistics → ``MCF``; else courier name or Manual."""
+    car = (carrier or "").strip()
+    c = car.lower()
+    tn = (tracking_no or "").strip()
+
+    for needle in (
+        "amazon",
+        "mcf",
+        "swiship",
+        "amzl",
+        "amzn",
+        "fulfillment by amazon",
+        "fba",
+    ):
+        if needle in c:
+            return "MCF"
+
+    if "delhi" in c:
+        return "Delhivery"
+    if "ithink" in c:
+        return "iThink"
+    if "bluedart" in c.replace(" ", ""):
+        return "Blue Dart"
+    if "ekart" in c:
+        return "Ekart"
+    if "xpressbees" in c.replace(" ", ""):
+        return "XpressBees"
+    if "shiprocket" in c.replace(" ", ""):
+        return "Shiprocket"
+
+    # Shopify often leaves carrier blank; long numeric AWB is common for Delhivery (India).
+    if not car or c in ("shopify", "other", "custom"):
+        if tn.isdigit() and 10 <= len(tn) <= 15:
+            return "Delhivery"
+        return "Manual"
+
+    return car[:50]
+
+
 def update_sheet_remarks(service, sheet_id, updates):
     """Batch update columns Q (source) and R (status) for given row numbers.
     updates = [{"row": 2, "source": "MCF", "status": "Fulfilled"}, ...]
@@ -206,6 +246,9 @@ def update_sheet_remarks(service, sheet_id, updates):
 
 def update_sheet_tracking(service, sheet_id, updates):
     """Batch update columns S (carrier), T (tracking_no), U (tracking_url), V (remark).
+    Also writes Q (Source) when ``tracking_no`` is non-empty — use ``source=`` to force,
+    or ``fill_source_q=False`` to skip Q (e.g. when Q/R just updated in same flow).
+
     updates = [{"row": 2, "carrier": "...", "tracking_no": "...", "url": "...", "remark": "..."}, ...]
     """
     if not updates:
@@ -222,6 +265,16 @@ def update_sheet_tracking(service, sheet_id, updates):
             "range": f"Sheet1!S{u['row']}:V{u['row']}",
             "values": [[u.get("carrier", ""), tn, u.get("url", ""), remark]],
         })
+        fill_q = u.get("fill_source_q", True)
+        if fill_q and str(tn).strip():
+            src = (u.get("source") or "").strip()
+            if not src:
+                src = infer_sheet_source_q(u.get("carrier", ""), tn)
+            if src:
+                data.append({
+                    "range": f"Sheet1!Q{u['row']}",
+                    "values": [[src]],
+                })
     service.spreadsheets().values().batchUpdate(
         spreadsheetId=sheet_id,
         body={"valueInputOption": "RAW", "data": data},
