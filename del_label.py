@@ -323,6 +323,29 @@ def row_get(row: Sequence[str], idx: Optional[int]) -> str:
     return (row[idx] or "").strip()
 
 
+def parse_sku_qty_pairs(sku_cell: str, qty_cell: str) -> Tuple[List[Tuple[str, int]], int]:
+    """Split comma-separated SKUs and quantities (same rules as app.py _process_orders)."""
+    skus = [s.strip() for s in str(sku_cell or "").split(",") if s.strip()]
+    raw_qty = str(qty_cell or "1").strip()
+    qtys_str = [q.strip() for q in raw_qty.split(",") if q.strip()]
+
+    if not skus:
+        return [], 1
+
+    if len(qtys_str) == 1 and len(skus) > 1:
+        q0 = int(qtys_str[0]) if qtys_str[0].isdigit() else 1
+        qtys = [q0] * len(skus)
+    else:
+        qtys = [int(q) if q.isdigit() else 1 for q in qtys_str]
+
+    while len(qtys) < len(skus):
+        qtys.append(1)
+
+    pairs = list(zip(skus, qtys))
+    total = sum(q for _, q in pairs)
+    return pairs, total
+
+
 def build_pkg_from_sheet_and_delhivery(
     pkg: dict, order_row: List[str], headers: List[str]
 ) -> Tuple[dict, str, str]:
@@ -353,7 +376,21 @@ def build_pkg_from_sheet_and_delhivery(
     title = row_get(order_row, i_title)
     qty = row_get(order_row, i_qty) or "1"
 
+    pairs, total_units = parse_sku_qty_pairs(sku, qty)
+    titles_split = [t.strip() for t in str(title or "").split(",") if str(title or "").strip()]
+    sku_detail_lines: List[str] = []
+    for i, (sk, q) in enumerate(pairs):
+        tit = titles_split[i] if i < len(titles_split) else ""
+        if tit:
+            sku_detail_lines.append(f"{sk} x{q} — {tit[:48]}")
+        elif sk:
+            sku_detail_lines.append(f"{sk} x{q}")
+    if not sku_detail_lines and sku:
+        sku_detail_lines.append(f"{sku.strip()} x{qty or '1'}")
+
     new_pkg = dict(pkg or {})
+    new_pkg["sku_detail_lines"] = sku_detail_lines
+    new_pkg["qty"] = str(total_units if total_units else qty).strip() or "1"
 
     if cust_name:
         new_pkg["name"] = cust_name
@@ -373,14 +410,14 @@ def build_pkg_from_sheet_and_delhivery(
 
     new_pkg["rs"] = amount if amount else new_pkg.get("rs", 0)
     new_pkg["cod"] = int(amount) if ("cod" in iscod or iscod == "true") else 0
-    new_pkg["qty"] = str(qty).strip() or str(new_pkg.get("qty", "1"))
 
     if not new_pkg.get("client_gst_tin"):
         new_pkg["client_gst_tin"] = SENDER_GST
     if not new_pkg.get("radd"):
         new_pkg["radd"] = DEFAULT_RETURN_ADDRESS
 
-    return new_pkg, sku, title
+    first_sku = pairs[0][0] if pairs else sku
+    return new_pkg, first_sku, title
 
 
 def wrap_text(text: str, max_chars: int) -> List[str]:
@@ -570,12 +607,14 @@ def render_label_page(canvas, pkg: dict, awb: str, sku: str, title: str) -> None
     canvas.drawRightString(mg + cw - 2 * mm, r5y + 1.5 * mm, "Total")
     cy = r5y
 
-    # Row 6: Product lines
-    prd_lines = []
-    if sku:
+    # Row 6: Product lines (multi-SKU / multi-qty from sheet)
+    prd_lines: List[str] = []
+    sku_detail_lines = pkg.get("sku_detail_lines") or []
+    if sku_detail_lines:
+        for line in sku_detail_lines:
+            prd_lines.extend(wrap_text(line, 32))
+    elif sku:
         prd_lines.extend(wrap_text(f"SKU: {sku}", 32))
-    # if title:
-    #     prd_lines.extend(wrap_text(f"Title: {title}", 32))
     if not prd_lines and product_desc:
         prd_lines.extend(wrap_text(product_desc, 32))
     if not prd_lines:

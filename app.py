@@ -531,13 +531,27 @@ def _process_orders(full_df, selected, mcf_sel, del_sel):
                 # ── Check Shopify Fulfillment Status Before Processing ──
                 s_order = get_shopify_order(order_id, shopify_cfg["headers"], shopify_cfg["shop_url"])
                 if s_order and str(s_order.get("fulfillment_status", "")).lower() == "fulfilled":
-                    st.toast(f"{order_id} already fulfilled in Shopify. Skipping.", icon="⚠️")
-                    db.update_order_status(order_id, "ALREADY_FULFILLED", reason="Skipped")
-                    sheet_updates.append({"row": row["row_number"], "source": "Skipped", "status": "Already Fulfilled on Shopify"})
-                    log.append({
-                        "order_id": order_id, "path": "MCF", "ok": True,
-                        "msg": "Skipped (Already fulfilled)", "shopify": "Fulfilled", "tracking": "—"
-                    })
+                    st.toast(f"{order_id} already fulfilled in Shopify — syncing sheet…", icon="ℹ️")
+                    ok_sync, msg_sync, trk = _sync_shopify_fulfilled_row_to_sheet(
+                        order_id,
+                        int(row["row_number"]),
+                        str(row.get("source", "")),
+                        shopify_cfg,
+                        sheets_service,
+                    )
+                    if not ok_sync:
+                        db.update_order_status(order_id, "ALREADY_FULFILLED", reason=msg_sync)
+                        log.append({
+                            "order_id": order_id, "path": "MCF", "ok": False,
+                            "msg": msg_sync, "shopify": "Fulfilled", "tracking": "—",
+                        })
+                    else:
+                        if not trk:
+                            db.update_order_status(order_id, "ALREADY_FULFILLED", reason="Shopify sync (no tracking)")
+                        log.append({
+                            "order_id": order_id, "path": "MCF", "ok": True,
+                            "msg": msg_sync, "shopify": "Fulfilled", "tracking": trk or "—",
+                        })
                     done += 1
                     progress.progress(done / total)
                     continue
@@ -583,7 +597,7 @@ def _process_orders(full_df, selected, mcf_sel, del_sel):
                 if success:
                     db.save_order(order_data)
                     db.update_order_status(order_id, "PROCESSING", fulfillment_channel="MCF")
-                    sheet_updates.append({"row": row["row_number"], "source": "MCF", "status": "Fulfilled"})
+                    sheet_updates.append({"row": row["row_number"], "source": "MCF", "status": "FULFILLED"})
 
                     # Shopify fulfill (MCF tracking comes async — no tracking yet at this stage)
                     shopify_ok, shopify_msg = _shopify_fulfill(order_id, shopify_cfg, tracking_info=None)
@@ -624,13 +638,27 @@ def _process_orders(full_df, selected, mcf_sel, del_sel):
                 # ── Check Shopify Fulfillment Status Before Processing ──
                 s_order = get_shopify_order(order_id, shopify_cfg["headers"], shopify_cfg["shop_url"])
                 if s_order and str(s_order.get("fulfillment_status", "")).lower() == "fulfilled":
-                    st.toast(f"{order_id} already fulfilled in Shopify. Skipping.", icon="⚠️")
-                    db.update_order_status(order_id, "ALREADY_FULFILLED", reason="Skipped")
-                    sheet_updates.append({"row": row["row_number"], "source": "Skipped", "status": "Already Fulfilled on Shopify"})
-                    log.append({
-                        "order_id": order_id, "path": "Delhivery", "ok": True,
-                        "msg": "Skipped (Already fulfilled)", "shopify": "Fulfilled", "tracking": "—"
-                    })
+                    st.toast(f"{order_id} already fulfilled in Shopify — syncing sheet…", icon="ℹ️")
+                    ok_sync, msg_sync, trk = _sync_shopify_fulfilled_row_to_sheet(
+                        order_id,
+                        int(row["row_number"]),
+                        str(row.get("source", "")),
+                        shopify_cfg,
+                        sheets_service,
+                    )
+                    if not ok_sync:
+                        db.update_order_status(order_id, "ALREADY_FULFILLED", reason=msg_sync)
+                        log.append({
+                            "order_id": order_id, "path": "Delhivery", "ok": False,
+                            "msg": msg_sync, "shopify": "Fulfilled", "tracking": "—",
+                        })
+                    else:
+                        if not trk:
+                            db.update_order_status(order_id, "ALREADY_FULFILLED", reason="Shopify sync (no tracking)")
+                        log.append({
+                            "order_id": order_id, "path": "Delhivery", "ok": True,
+                            "msg": msg_sync, "shopify": "Fulfilled", "tracking": trk or "—",
+                        })
                     done += 1
                     progress.progress(done / total)
                     continue
@@ -653,7 +681,7 @@ def _process_orders(full_df, selected, mcf_sel, del_sel):
                     if waybill:
                         db.update_order_tracking(order_id, "Delhivery", waybill, "")
 
-                    sheet_updates.append({"row": row["row_number"], "source": "Delhivery", "status": "Fulfilled"})
+                    sheet_updates.append({"row": row["row_number"], "source": "Delhivery", "status": "FULFILLED"})
 
                     # Delhivery waybill → Queue sheet tracking update (S/T/U)
                     if waybill and row.get("row_number"):
@@ -737,6 +765,146 @@ def _shopify_fulfill(order_id, shopify_cfg, tracking_info=None):
         return True, "Already fulfilled (no change)"
     except Exception as e:
         return False, str(e)[:80]
+
+
+def row_indicates_fulfilled_for_mcf_lookup(fulfilled_str: str) -> bool:
+    """Column R (fulfilled) must suggest fulfillment before we call MCF / Delhivery AWB APIs."""
+    return "ful" in (fulfilled_str or "").lower()
+
+
+def _sync_shopify_fulfilled_row_to_sheet(order_id, row_number, row_source, shopify_cfg, sheets_service):
+    """Shopify already fulfilled: pull fulfillments, sync S/T/U/V and Q/R (R=FULFILLED). Returns (ok, message, tracking_or_none)."""
+    s_order = get_shopify_order(order_id, shopify_cfg["headers"], shopify_cfg["shop_url"])
+    if not s_order:
+        return False, "Order not found on Shopify", None
+    shop_url = shopify_cfg["shop_url"]
+    headers = shopify_cfg["headers"]
+    f_url = f"{shop_url}/admin/api/2024-01/orders/{s_order['id']}/fulfillments.json"
+    try:
+        fr = requests.get(f_url, headers=headers, timeout=30)
+        fr.raise_for_status()
+        fulfillments = fr.json().get("fulfillments", [])
+    except Exception as e:
+        return False, str(e)[:120], None
+
+    tracking_no = ""
+    carrier = ""
+    for f in reversed(fulfillments):
+        if f.get("status") not in ("success", "pending", "open"):
+            continue
+        tn = (f.get("tracking_number") or "").strip()
+        if tn:
+            tracking_no = tn
+            carrier = (f.get("tracking_company") or "").strip()
+            break
+    if not tracking_no:
+        for f in reversed(fulfillments):
+            if f.get("status") not in ("success", "pending", "open"):
+                continue
+            tracking_no = (f.get("tracking_number") or "").strip()
+            carrier = (f.get("tracking_company") or "").strip()
+            break
+
+    db.mark_shopify_fulfilled(order_id)
+    src = (row_source or "").strip() or "Shopify"
+    update_sheet_remarks(sheets_service, SHEET_ID, [{"row": row_number, "source": src, "status": "FULFILLED"}])
+
+    now_r = datetime.now().strftime("%d/%m %H:%M")
+    if tracking_no:
+        db.update_order_tracking(order_id, carrier or "Shopify", tracking_no, "")
+        update_sheet_tracking(sheets_service, SHEET_ID, [{
+            "row": row_number,
+            "carrier": carrier or "",
+            "tracking_no": tracking_no,
+            "url": "",
+            "remark": f"Shopify sync {now_r}",
+        }])
+        return True, f"Synced tracking {tracking_no}", tracking_no
+
+    update_sheet_tracking(sheets_service, SHEET_ID, [{
+        "row": row_number,
+        "carrier": "",
+        "tracking_no": "",
+        "url": "",
+        "remark": "Shopify fulfilled — no tracking on fulfillment",
+    }])
+    return True, "Shopify fulfilled — no tracking on fulfillment", None
+
+
+def _compute_planning_stale_rows(sheets_service, min_age_days: int = 2):
+    """MCF rows with Planning in R/V and order date (col C or header) older than min_age_days."""
+    result = sheets_service.spreadsheets().values().get(
+        spreadsheetId=SHEET_ID, range="Sheet1!A:AF"
+    ).execute()
+    rows = result.get("values", [])
+    if len(rows) <= 1:
+        return []
+
+    headers = [str(h).strip().lower() for h in rows[0]]
+
+    def get_idx(*names):
+        for name in names:
+            key = name.strip().lower()
+            if key in headers:
+                return headers.index(key)
+        return -1
+
+    source_idx = get_idx("source")
+    order_id_idx = get_idx("ord_serial", "order id", "order")
+    date_idx = get_idx("date", "order date")
+    if date_idx == -1:
+        date_idx = 2
+    fulfilled_idx = get_idx("fulfilled", "fulfillment", "column r")
+    remark_idx = get_idx("remark", "remarks", "v")
+
+    today = datetime.now().date()
+    stale = []
+    for i, row in enumerate(rows[1:], start=2):
+
+        def sg(idx):
+            if idx >= 0 and idx < len(row):
+                return str(row[idx]).strip()
+            return ""
+
+        source = sg(source_idx)
+        if "MCF" not in source.upper():
+            continue
+
+        r_text = sg(fulfilled_idx) if fulfilled_idx >= 0 else ""
+        v_text = sg(remark_idx) if remark_idx >= 0 else ""
+        status_blob = f"{r_text} {v_text}"
+        if "planning" not in status_blob.lower():
+            continue
+
+        date_raw = sg(date_idx)
+        if not date_raw:
+            continue
+        try:
+            c = date_raw.strip()
+            if "T" not in c and len(c) >= 10:
+                c = c.replace(" ", "T", 1)
+            order_date = datetime.fromisoformat(c.replace("Z", "+00:00")).date()
+        except ValueError:
+            try:
+                order_date = datetime.strptime(c[:10], "%Y-%m-%d").date()
+            except ValueError:
+                continue
+
+        age = (today - order_date).days
+        if age <= min_age_days:
+            continue
+
+        oid = sg(order_id_idx).replace("#", "").strip()
+        stale.append({
+            "order_id": oid,
+            "row": i,
+            "order_date": date_raw[:32],
+            "age_days": age,
+            "column_r": r_text,
+            "column_v": v_text,
+        })
+    stale.sort(key=lambda x: -x["age_days"])
+    return stale
 
 
 # ─────────────────────────────────────────────
@@ -823,6 +991,21 @@ def _render_awb_fetch():
     m2.metric("✅ Tracking Added", len(has_trk))
     m3.metric("⏳ Tracking Pending", len(need_trk))
 
+    with st.expander("📅 Planning stale (MCF + Planning, order date > 2 days)", expanded=False):
+        st.caption("Uses column **C** for order date if no Date / Order date header is found; checks Source = MCF and **Planning** in column R and/or remark column.")
+        if st.button("Refresh planning-stale list", key="plan_stale_refresh"):
+            st.session_state.pop("_planning_stale_cache", None)
+        try:
+            if "_planning_stale_cache" not in st.session_state:
+                st.session_state._planning_stale_cache = _compute_planning_stale_rows(init_sheets_service())
+            stale_df = st.session_state._planning_stale_cache
+            if stale_df:
+                st.dataframe(pd.DataFrame(stale_df), width="stretch", hide_index=True)
+            else:
+                st.info("No matching rows.")
+        except Exception as e:
+            st.error(f"Could not load planning-stale rows: {e}")
+
     # ── Tabs: Pending | Already have tracking ────────────────────────────
     t1, t2 = st.tabs([f"⏳ Pending ({len(need_trk)})", f"✅ Tracking Added ({len(has_trk)})"])
 
@@ -850,7 +1033,8 @@ def _render_awb_fetch():
                         return
 
                     sheet_updates        = []   # S/T/U/V — tracking + status remark
-                    no_trk_remark_updates = []  # Q/R — MCF status for orders without tracking
+                    no_trk_remark_updates = []  # Q/R — R empty for planning; FULFILLED when tracking found
+                    fulfilled_qr_updates  = []  # Q/R = FULFILLED when AWB fetch succeeds
                     result_rows          = []
                     prog = st.progress(0)
                     status_txt = st.empty()
@@ -860,6 +1044,19 @@ def _render_awb_fetch():
                         order_id = order["order_id"]
                         orig_source = str(order.get("source", "")).upper()
                         status_txt.text(f"Checking {order_id} ({i+1}/{total})...")
+
+                        if not row_indicates_fulfilled_for_mcf_lookup(order.get("fulfilled", "")):
+                            result_rows.append({
+                                "Order ID": order_id,
+                                "Customer": order["customer"],
+                                "Status": "Skipped — column R has no 'ful'",
+                                "Tracking ID": "—",
+                                "Carrier": "—",
+                                "Shopify": "—",
+                                "Sheet": "— (unchanged)",
+                            })
+                            prog.progress((i + 1) / total)
+                            continue
 
                         tn, cc, mcf_status = "", "", ""
                         is_delhivery_first = "DELHI" in orig_source
@@ -877,6 +1074,7 @@ def _render_awb_fetch():
                             s_ok, s_msg = _shopify_fulfill(order_id, shopify_cfg, tracking_info=t_info)
 
                             sheet_updates.append({"row": order["row_number"], "carrier": cc or "Amazon", "tracking_no": tn, "url": "", "remark": remark})
+                            fulfilled_qr_updates.append({"row": order["row_number"], "source": "MCF", "status": "FULFILLED"})
                             result_rows.append({"Order ID": order_id, "Customer": order["customer"], "Status": mcf_status, "Tracking ID": tn, "Carrier": cc or "", "Shopify": "✅ Fulfilled" if s_ok else f"⚠️ {s_msg}", "Sheet": "✅ Updated"})
                         else:
                             # ── Delhivery Check (Either Fallback or Primary) ──
@@ -885,12 +1083,14 @@ def _render_awb_fetch():
                                 if del_found and del_awb:
                                     from datetime import datetime as _dt
                                     remark = f"Delhivery AWB {_dt.now().strftime('%d/%m %H:%M')}"
+                                    if del_status:
+                                        remark = f"{remark} | {del_status}"
                                     db.update_order_tracking(order_id, "Delhivery", del_awb, "")
                                     t_info = {"number": del_awb, "company": "Delhivery", "url": ""}
                                     s_ok, s_msg = _shopify_fulfill(order_id, shopify_cfg, tracking_info=t_info)
 
                                     sheet_updates.append({"row": order["row_number"], "carrier": "Delhivery", "tracking_no": del_awb, "url": "", "remark": remark})
-                                    no_trk_remark_updates.append({"row": order["row_number"], "source": "Delhivery", "status": f"Fulfilled | {del_status}" if del_status else "Fulfilled"})
+                                    fulfilled_qr_updates.append({"row": order["row_number"], "source": "Delhivery", "status": "FULFILLED"})
                                     result_rows.append({"Order ID": order_id, "Customer": order["customer"], "Status": "Found on Delhivery", "Tracking ID": del_awb, "Carrier": "Delhivery", "Shopify": "✅ Fulfilled" if s_ok else f"⚠️ {s_msg}", "Sheet": "✅ Delhivery AWB"})
                                     prog.progress((i + 1) / total)
                                     time.sleep(0.4)
@@ -907,8 +1107,8 @@ def _render_awb_fetch():
                                 }.get(mcf_status, f"MCF: {mcf_status}")
 
                             sheet_updates.append({"row": order["row_number"], "carrier": "", "tracking_no": "", "url": "", "remark": status_label})
-                            no_trk_remark_updates.append({"row": order["row_number"], "source": "Delhivery" if is_delhivery_first else "MCF", "status": status_label})
-                            result_rows.append({"Order ID": order_id, "Customer": order["customer"], "Status": mcf_status if not is_delhivery_first else "Delhivery Not Found", "Tracking ID": "—", "Carrier": "—", "Shopify": "—", "Sheet": f"✅ R col: {status_label}"})
+                            no_trk_remark_updates.append({"row": order["row_number"], "source": "Delhivery" if is_delhivery_first else "MCF", "status": ""})
+                            result_rows.append({"Order ID": order_id, "Customer": order["customer"], "Status": mcf_status if not is_delhivery_first else "Delhivery Not Found", "Tracking ID": "—", "Carrier": "—", "Shopify": "—", "Sheet": f"✅ V: {status_label}"})
 
                         prog.progress((i + 1) / total)
                         time.sleep(0.4)
@@ -923,11 +1123,12 @@ def _render_awb_fetch():
                         except Exception as e:
                             st.error(f"Sheet S/T/U/V update failed: {e}")
 
-                    # Batch update Q/R for orders WITHOUT tracking (so user sees MCF status in visible cols)
-                    if no_trk_remark_updates:
+                    # Batch update Q/R — FULFILLED when tracking found; R cleared when only planning/status in V
+                    all_qr = fulfilled_qr_updates + no_trk_remark_updates
+                    if all_qr:
                         try:
-                            update_sheet_remarks(sheets_svc, SHEET_ID, no_trk_remark_updates)
-                            db.log_sync("SHEET_REMARKS", "SUCCESS", f"{len(no_trk_remark_updates)} no-tracking rows → Q/R updated")
+                            update_sheet_remarks(sheets_svc, SHEET_ID, all_qr)
+                            db.log_sync("SHEET_REMARKS", "SUCCESS", f"{len(all_qr)} rows → Q/R updated")
                         except Exception as e:
                             st.error(f"Sheet Q/R update failed: {e}")
 
@@ -1215,7 +1416,7 @@ def page_shopify_tools():
                                 sheet_updates_qr.append({
                                     "row": row_map[oid],
                                     "source": "Manual",
-                                    "status": "Fulfilled"
+                                    "status": "FULFILLED"
                                 })
                         else:
                             results.append({"Order ID": oid, "Status": "❌ Error", "Message": "Not found on Shopify"})
@@ -1282,7 +1483,7 @@ def page_shopify_tools():
                                     sheet_updates_qr.append({
                                         "row": row_num,
                                         "source": car,
-                                        "status": "Fulfilled"
+                                        "status": "FULFILLED"
                                     })
                                     sheet_updates_st.append({
                                         "row": row_num,

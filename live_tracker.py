@@ -51,6 +51,27 @@ def normalize_status(raw_state, raw_event=""):
         return "Delivered"
     return "Intransit"
 
+
+def looks_like_tracking_number(value) -> bool:
+    """True if column T likely holds a carrier AWB / tracking id (not a status placeholder)."""
+    if value is None:
+        return False
+    s = str(value).strip()
+    if not s or len(s) < 8:
+        return False
+    low = s.lower()
+    if "mcf:" in low:
+        return False
+    if "processing" in low:
+        return False
+    for bad in ("pending", "not assigned", "n/a", "na", "tbd", "—", "-", "none", "placeholder"):
+        if low == bad:
+            return False
+    if not any(c.isdigit() for c in s):
+        return False
+    return True
+
+
 def col_num_to_a1(col_num):
     # col_num is 1-based index to A, B, C...
     result = ""
@@ -226,7 +247,7 @@ def run_live_tracking_update(progress_callback=None):
         is_delhivery = "delhivery" in carrier.lower()
         is_ithink = "ithink" in carrier.lower()
 
-        if tracking_no:
+        if tracking_no and looks_like_tracking_number(tracking_no):
             # Skip if already delivered or RTO is delivered
             if existing_status.lower() == "delivered":
                 continue
