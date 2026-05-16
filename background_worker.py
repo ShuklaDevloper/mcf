@@ -100,14 +100,14 @@ def auto_fetch_source_orders():
                 "is_cod": str(o.get("is_cod", "")),
                 "seller_sku": o.get("seller_sku", ""),
                 "title": o.get("title", "")[:200],
-                "qty": int(o.get("qty", 1) or 1),
-                "row_number": int(o.get("row_number", 0) or 0),
+                "qty": db.safe_int_qty(o.get("qty", 1), 1),
+                "row_number": db.safe_row_number(o.get("row_number", 0)),
                 "source_channel": "SHOPIFY",
                 "payment_info": payment_info,
                 "items": [{
                     "seller_sku": o.get("seller_sku", ""),
                     "title": o.get("title", ""),
-                    "quantity": int(o.get("qty", 1) or 1),
+                    "quantity": db.safe_int_qty(o.get("qty", 1), 1),
                     "price": o.get("amount", 0),
                 }],
             }
@@ -178,6 +178,7 @@ def poll_mcf_tracking():
                         "carrier": cc or "",
                         "tracking_no": tn,
                         "url": "",
+                        "source": "MCF",
                     })
             else:
                 print(f"  … {order_id} → no tracking yet")
