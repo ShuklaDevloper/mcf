@@ -275,6 +275,35 @@ def _parse_row_date_for_filter(val):
             return None
 
 
+def _report_safe_int_qty(val, default=1):
+    """Same rules as db.safe_int_qty; local copy so Reports works if Cloud has older db.py."""
+    if val is None or val == "":
+        return default
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        return int(val)
+    s = str(val).strip()
+    if not s:
+        return default
+    if s.isdigit():
+        return int(s)
+    parts = [p.strip() for p in s.split(",") if p.strip().isdigit()]
+    if parts:
+        return sum(int(p) for p in parts)
+    try:
+        return int(float(s))
+    except ValueError:
+        return default
+
+
+def _report_safe_row_number(val, default=0):
+    if val is None or val == "":
+        return default
+    try:
+        return int(float(str(val).strip()))
+    except (ValueError, TypeError):
+        return default
+
+
 def sheet_row_to_report_dict(row) -> dict:
     """Map fetch_endpoint_orders row → same shape as DB for Reports."""
     fulfilled = str(row.get("fulfilled", "")).strip()
@@ -308,10 +337,10 @@ def sheet_row_to_report_dict(row) -> dict:
         "total_amount": float(row.get("amount", 0) or 0),
         "created_at": created,
         "updated_at": created,
-        "row_number": db.safe_row_number(row.get("row_number", 0)),
+        "row_number": _report_safe_row_number(row.get("row_number", 0)),
         "seller_sku": str(row.get("seller_sku", "")),
         "title": str(row.get("title", ""))[:200],
-        "qty": db.safe_int_qty(row.get("qty", 1), 1),
+        "qty": _report_safe_int_qty(row.get("qty", 1), 1),
         "is_cod": 1 if str(row.get("is_cod", "")).lower() in ("true", "yes", "1", "cod") else 0,
         "pincode": str(row.get("pincode", "")),
         "city": str(row.get("city", "")),
@@ -1680,13 +1709,13 @@ def page_sync():
                             "is_cod": str(o.get("is_cod", "")),
                             "seller_sku": o.get("seller_sku", ""),
                             "title": o.get("title", "")[:200],
-                            "qty": db.safe_int_qty(o.get("qty", 1), 1),
-                            "row_number": db.safe_row_number(o.get("row_number", 0)),
+                            "qty": _report_safe_int_qty(o.get("qty", 1), 1),
+                            "row_number": _report_safe_row_number(o.get("row_number", 0)),
                             "source_channel": "SHOPIFY",
                             "items": [{
                                 "seller_sku": o.get("seller_sku", ""),
                                 "title": o.get("title", ""),
-                                "quantity": db.safe_int_qty(o.get("qty", 1), 1),
+                                "quantity": _report_safe_int_qty(o.get("qty", 1), 1),
                                 "price": o.get("amount", 0),
                             }],
                         }
