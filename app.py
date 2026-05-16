@@ -24,6 +24,7 @@ from utils import (
     get_delhivery_tracking,
     get_shopify_config,
     get_shopify_order,
+    infer_sheet_source_q,
     init_sheets_service,
     parse_date,
     read_secret,
@@ -309,27 +310,37 @@ def sheet_row_to_report_dict(row) -> dict:
     fulfilled = str(row.get("fulfilled", "")).strip()
     source = str(row.get("source", "")).strip()
     tracking = str(row.get("tracking_no", "")).strip()
+    sheet_st = str(row.get("status", "")).strip()
+    # Sheet Q/R/V can all say Cancelled — must not treat as PROCESSING just because `source` is non-empty
+    blob = f"{source.lower()} {fulfilled.lower()} {sheet_st.lower()}"
+    cancelled = "cancel" in blob
+
     ch = ""
     su = source.upper()
     if "DELHI" in su:
         ch = "DELHIVERY"
     elif "MCF" in su:
         ch = "MCF"
+
     status = "NEW"
     fl = fulfilled.lower()
-    if row.get("is_error") or "error" in fl or "fail" in fl:
+    st_l = sheet_st.lower()
+    if cancelled:
+        status = "CANCELLED"
+    elif row.get("is_error") or "error" in fl or "fail" in fl or "error" in st_l or "fail" in st_l:
         status = "FAILED"
-    elif "deliver" in fl:
+    elif "deliver" in fl or "deliver" in st_l:
         status = "DELIVERED"
     elif tracking:
         status = "SHIPPED"
-    elif source:
+    elif source and not cancelled:
         status = "PROCESSING"
     created = str(row.get("date", ""))
     return {
         "order_id": row.get("order_id", ""),
         "customer_name": row.get("customer", "") or "",
         "status": status,
+        "sheet_status": sheet_st,
         "fulfillment_channel": ch,
         "tracking_number": tracking,
         "tracking_company": str(row.get("carrier", "")),
@@ -344,6 +355,7 @@ def sheet_row_to_report_dict(row) -> dict:
         "is_cod": 1 if str(row.get("is_cod", "")).lower() in ("true", "yes", "1", "cod") else 0,
         "pincode": str(row.get("pincode", "")),
         "city": str(row.get("city", "")),
+        "source_sheet_q": source,
         "sheet_fulfilled": fulfilled,
         "column_r": fulfilled,
         "source_channel": "SHOPIFY",
@@ -359,6 +371,7 @@ def merge_db_and_sheet_reports(db_orders: list, sheet_report_rows: list) -> list
         if oid:
             row = dict(r)
             row["column_r"] = str(row.get("sheet_fulfilled", row.get("column_r", "")) or "")
+            row["sheet_status"] = str(row.get("sheet_status", row.get("status", "")) or "")
             by_oid[oid] = row
     for r in db_orders:
         oid = str(r.get("order_id", "")).strip()
@@ -369,8 +382,11 @@ def merge_db_and_sheet_reports(db_orders: list, sheet_report_rows: list) -> list
         d["_data_source"] = "db"
         if prev:
             d["column_r"] = str(prev.get("column_r", prev.get("sheet_fulfilled", "")) or "")
+            d["sheet_status"] = str(prev.get("sheet_status", "") or "")
+            d["source_sheet_q"] = str(prev.get("source_sheet_q", "") or "")
         else:
             d["column_r"] = str(d.get("sheet_fulfilled", "") or "")
+            d["sheet_status"] = str(d.get("sheet_status", "") or "")
         by_oid[oid] = d
     return list(by_oid.values())
 
@@ -409,6 +425,9 @@ def row_matches_column_r_filter(column_r_value, categories: list) -> bool:
                 return True
         elif tag == "Includes 'MCF:'":
             if "mcf:" in rv_l:
+                return True
+        elif tag == "Includes 'cancel'":
+            if "cancel" in rv_l:
                 return True
         elif tag == "Includes 'error' or 'fail'":
             if "error" in rv_l or "fail" in rv_l:
@@ -460,7 +479,8 @@ def apply_report_filters_python(
             cname = str(r.get("customer_name", "")).lower()
             trk = str(r.get("tracking_number", "")).lower()
             rcol = str(r.get("column_r", "")).lower()
-            if s not in oid and s not in cname and s not in trk and s not in rcol:
+            sst = str(r.get("sheet_status", "")).lower()
+            if s not in oid and s not in cname and s not in trk and s not in rcol and s not in sst:
                 continue
         out.append(r)
     out.sort(key=lambda x: str(x.get("created_at") or x.get("updated_at") or ""), reverse=True)
@@ -998,6 +1018,7 @@ def _process_orders(full_df, selected, mcf_sel, del_sel):
                             "carrier": "Delhivery",
                             "tracking_no": waybill,
                             "url": f"https://www.delhivery.com/track/package/{waybill}",
+                            "fill_source_q": False,
                         })
 
                     # Shopify fulfill WITH tracking info if waybill available
@@ -1114,7 +1135,10 @@ def _sync_shopify_fulfilled_row_to_sheet(order_id, row_number, row_source, shopi
             break
 
     db.mark_shopify_fulfilled(order_id)
-    src = (row_source or "").strip() or "Shopify"
+    if tracking_no:
+        src = infer_sheet_source_q(carrier, tracking_no)
+    else:
+        src = (row_source or "").strip() or "Shopify"
     update_sheet_remarks(sheets_service, SHEET_ID, [{"row": row_number, "source": src, "status": "FULFILLED"}])
 
     now_r = datetime.now().strftime("%d/%m %H:%M")
@@ -1126,6 +1150,7 @@ def _sync_shopify_fulfilled_row_to_sheet(order_id, row_number, row_source, shopi
             "tracking_no": tracking_no,
             "url": "",
             "remark": f"Shopify sync {now_r}",
+            "fill_source_q": False,
         }])
         return True, f"Synced tracking {tracking_no}", tracking_no
 
@@ -1135,6 +1160,7 @@ def _sync_shopify_fulfilled_row_to_sheet(order_id, row_number, row_source, shopi
         "tracking_no": "",
         "url": "",
         "remark": "Shopify fulfilled — no tracking on fulfillment",
+        "fill_source_q": False,
     }])
     return True, "Shopify fulfilled — no tracking on fulfillment", None
 
@@ -1426,6 +1452,8 @@ def _render_awb_fetch():
                     # Batch update S/T/U/V for orders WITH tracking
                     if sheet_updates:
                         try:
+                            for su in sheet_updates:
+                                su["fill_source_q"] = False
                             update_sheet_tracking(sheets_svc, SHEET_ID, sheet_updates)
                             db.log_sync("SHEET_TRACKING", "SUCCESS", f"{len(sheet_updates)} rows updated")
                         except Exception as e:
@@ -1478,14 +1506,21 @@ def _render_awb_fetch():
                                     try:
                                         from datetime import datetime as _dt
                                         svc = init_sheets_service()
+                                        _src = infer_sheet_source_q(cc or "Amazon", tn)
+                                        update_sheet_remarks(svc, SHEET_ID, [{
+                                            "row": o_meta["row_number"],
+                                            "source": _src,
+                                            "status": "FULFILLED",
+                                        }])
                                         update_sheet_tracking(svc, SHEET_ID, [{
                                             "row": o_meta["row_number"],
                                             "carrier": cc or "Amazon",
                                             "tracking_no": tn,
                                             "url": "",
                                             "remark": f"Tracking Added {_dt.now().strftime('%d/%m %H:%M')}",
+                                            "fill_source_q": False,
                                         }])
-                                        st.success("✅ Sheet updated (S/T/U/V)")
+                                        st.success("✅ Sheet updated (Q/R + S/T/U/V)")
                                     except Exception as e:
                                         st.warning(f"Sheet failed: {e}")
                             else:
@@ -1518,7 +1553,7 @@ def page_reports():
     with st.expander("🔍 Filters", expanded=True):
         fc1, fc2, fc3 = st.columns(3)
         with fc1:
-            status_opts = ["All", "NEW", "PROCESSING", "SHIPPED", "DELIVERED", "FAILED"]
+            status_opts = ["All", "NEW", "PROCESSING", "SHIPPED", "DELIVERED", "FAILED", "CANCELLED"]
             sel_status = st.multiselect(
                 "Status",
                 status_opts,
@@ -1574,6 +1609,7 @@ def page_reports():
                 "Includes 'Planning'",
                 "Includes 'ful'",
                 "Includes 'MCF:'",
+                "Includes 'cancel'",
                 "Includes 'error' or 'fail'",
             ]
             sel_r = st.multiselect(
@@ -1889,7 +1925,7 @@ def page_shopify_tools():
                                     row_num = row_map[oid]
                                     sheet_updates_qr.append({
                                         "row": row_num,
-                                        "source": car,
+                                        "source": infer_sheet_source_q(car, tid),
                                         "status": "FULFILLED"
                                     })
                                     sheet_updates_st.append({
@@ -1897,7 +1933,8 @@ def page_shopify_tools():
                                         "carrier": car,
                                         "tracking_no": tid,
                                         "url": "",
-                                        "remark": "Manual Update"
+                                        "remark": "Manual Update",
+                                        "fill_source_q": False,
                                     })
                             else:
                                 results.append({"Order ID": oid, "Tracking": tid, "Carrier": car, "Status": "❌ Error", "Message": "Not found on Shopify"})
