@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>app.py Architecture Flowchart</title>
+    <script type="module">
+        import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+        mermaid.initialize({ startOnLoad: true, theme: 'default' });
+    </script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 2rem;
+            background-color: #f5f5f5;
+        }
+        .mermaid {
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+    </style>
+</head>
+<body>
+    <h1>app.py Architecture Flowchart</h1>
+    <div class="mermaid">
+        graph TD
+            %% Main Application Entry
+            A[app.py : Streamlit UI] --> B{Sidebar Navigation}
+            
+            %% Pages
+            B -->|Dashboard| C[page_dashboard]
+            B -->|Orders| D[page_orders]
+            B -->|Tracking| E[page_tracking]
+            B -->|Reports| F[Reports / Sync / Labels...]
+
+            %% Database Dependency
+            C -.->|Fetches Stats & Orders| DB[(db.py : SQLite)]
+            D -.->|Reads/Writes Orders| DB
+
+            %% Page: Orders Logic
+            D --> D1[fetch_endpoint_orders]
+            D1 -.->|Fetches via Apps Script| GS[Google Sheets]
+            
+            D --> D2[_process_orders]
+            
+            %% Order Processing logic
+            D2 -->|MCF Selected| MCF[create_mcf_order]
+            D2 -->|Delhivery Selected| DEL[create_delhivery_order]
+            
+            %% Helper Utilities
+            MCF -.-> UT[utils.py]
+            DEL -.-> UT
+            
+            %% Shopify Integration
+            D2 --> SHOPIFY[_shopify_fulfill]
+            SHOPIFY -.->|fulfill_order & get_shopify_order| UT
+            
+            %% Sheet Updates
+            D2 --> SHEET_UP[update_sheet_remarks]
+            SHEET_UP -.-> UT
+            UT -.->|Syncs Data| GS
+            UT -.->|Updates| SHOP[Shopify API]
+            UT -.->|Calls| AMZ[Amazon MCF API]
+            UT -.->|Calls| DEL_API[Delhivery API]
+
+            %% Page: Tracking Logic
+            E --> E1[_render_live_updates]
+            E --> E2[_render_awb_fetch]
+
+            E1 --> LT[live_tracker.py : run_live_tracking_update]
+            LT -.->|Tracks Packages| DEL_API
+            LT -.->|Tracks Packages| AMZ
+
+            E2 -.-> W[w.py : fetch_mcf_data]
+            W -.->|Fetches Shipments| AMZ
+            
+            %% Styling
+            classDef page fill:#f9f,stroke:#333,stroke-width:2px;
+            classDef ext fill:#bfb,stroke:#333,stroke-width:2px;
+            classDef dep fill:#bbf,stroke:#333,stroke-width:2px;
+            
+            class C,D,E,F page;
+            class GS,SHOP,AMZ,DEL_API ext;
+            class DB,UT,LT,W dep;
+    </div>
+</body>
+</html>
