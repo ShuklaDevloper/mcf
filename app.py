@@ -244,6 +244,191 @@ def fetch_endpoint_orders():
     return pending, processed, None
 
 
+@st.cache_data(ttl=120)
+def _cached_endpoint_snapshot():
+    """Cached Apps Script fetch — safe for Streamlit Cloud (SQLite often empty)."""
+    return fetch_endpoint_orders()
+
+
+def ensure_sheet_orders_loaded():
+    """Load pending/processed from sheet once per session (first page visit)."""
+    if st.session_state.pending_df is not None:
+        return
+    pending, processed, err = _cached_endpoint_snapshot()
+    st.session_state.pending_df = pd.DataFrame(pending) if pending else pd.DataFrame()
+    st.session_state.processed_df = pd.DataFrame(processed) if processed else pd.DataFrame()
+    st.session_state._endpoint_snapshot_error = err
+
+
+def _parse_row_date_for_filter(val):
+    if not val:
+        return None
+    s = str(val).strip()
+    try:
+        if "T" not in s and len(s) >= 10:
+            s = s.replace(" ", "T", 1)
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).date()
+    except ValueError:
+        try:
+            return datetime.strptime(s[:10], "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+
+def sheet_row_to_report_dict(row) -> dict:
+    """Map fetch_endpoint_orders row → same shape as DB for Reports."""
+    fulfilled = str(row.get("fulfilled", "")).strip()
+    source = str(row.get("source", "")).strip()
+    tracking = str(row.get("tracking_no", "")).strip()
+    ch = ""
+    su = source.upper()
+    if "DELHI" in su:
+        ch = "DELHIVERY"
+    elif "MCF" in su:
+        ch = "MCF"
+    status = "NEW"
+    fl = fulfilled.lower()
+    if row.get("is_error") or "error" in fl or "fail" in fl:
+        status = "FAILED"
+    elif "deliver" in fl:
+        status = "DELIVERED"
+    elif tracking:
+        status = "SHIPPED"
+    elif source:
+        status = "PROCESSING"
+    created = str(row.get("date", ""))
+    return {
+        "order_id": row.get("order_id", ""),
+        "customer_name": row.get("customer", "") or "",
+        "status": status,
+        "fulfillment_channel": ch,
+        "tracking_number": tracking,
+        "tracking_company": str(row.get("carrier", "")),
+        "tracking_url": "",
+        "total_amount": float(row.get("amount", 0) or 0),
+        "created_at": created,
+        "updated_at": created,
+        "row_number": int(row.get("row_number", 0) or 0),
+        "seller_sku": str(row.get("seller_sku", "")),
+        "title": str(row.get("title", ""))[:200],
+        "qty": int(row.get("qty", 1) or 1),
+        "is_cod": 1 if str(row.get("is_cod", "")).lower() in ("true", "yes", "1", "cod") else 0,
+        "pincode": str(row.get("pincode", "")),
+        "city": str(row.get("city", "")),
+        "sheet_fulfilled": fulfilled,
+        "source_channel": "SHOPIFY",
+        "_data_source": "sheet",
+    }
+
+
+def merge_db_and_sheet_reports(db_orders: list, sheet_report_rows: list) -> list:
+    """DB rows override sheet for same order_id (fulfillment trail wins)."""
+    by_oid = {}
+    for r in sheet_report_rows:
+        oid = str(r.get("order_id", "")).strip()
+        if oid:
+            by_oid[oid] = dict(r)
+    for r in db_orders:
+        oid = str(r.get("order_id", "")).strip()
+        if not oid:
+            continue
+        d = dict(r)
+        d["_data_source"] = "db"
+        by_oid[oid] = d
+    return list(by_oid.values())
+
+
+def apply_report_filters_python(rows, status_filter, channel_filter, date_from, date_to, search) -> list:
+    """Same rules as db.get_orders_filtered, for merged in-memory rows."""
+    out = []
+    for r in rows:
+        if status_filter:
+            stv = str(r.get("status", "") or "")
+            if isinstance(status_filter, list):
+                if stv not in status_filter:
+                    continue
+            elif stv != status_filter:
+                continue
+        if channel_filter:
+            ch = str(r.get("fulfillment_channel", "") or "").upper()
+            allowed = [cf.upper() for cf in channel_filter]
+            match = ("DELHIVERY" in allowed and ch == "DELHIVERY") or ("MCF" in allowed and ch == "MCF")
+            if not match:
+                continue
+        if date_from or date_to:
+            rd = _parse_row_date_for_filter(r.get("created_at") or r.get("updated_at"))
+            if rd is None:
+                continue
+            if date_from and rd < date_from:
+                continue
+            if date_to and rd > date_to:
+                continue
+        if search:
+            s = search.lower()
+            oid = str(r.get("order_id", "")).lower()
+            cname = str(r.get("customer_name", "")).lower()
+            trk = str(r.get("tracking_number", "")).lower()
+            if s not in oid and s not in cname and s not in trk:
+                continue
+        out.append(r)
+    out.sort(key=lambda x: str(x.get("created_at") or x.get("updated_at") or ""), reverse=True)
+    return out[:1000]
+
+
+def compute_sheet_dashboard_stats(pending: list, processed: list) -> dict:
+    """Approximate db.get_stats() from live sheet rows (for Streamlit Cloud)."""
+    all_r = list(pending) + list(processed)
+    if not all_r:
+        return db.get_stats()
+    with_trk = sum(1 for r in all_r if str(r.get("tracking_no", "")).strip())
+    mcf = sum(1 for r in all_r if "MCF" in str(r.get("source", "")).upper())
+    delh = sum(1 for r in all_r if "DELHI" in str(r.get("source", "")).upper())
+    failed = sum(1 for r in all_r if r.get("is_error") or "error" in str(r.get("fulfilled", "")).lower() or "fail" in str(r.get("fulfilled", "")).lower())
+    cod = sum(1 for r in all_r if str(r.get("is_cod", "")).lower() in ("true", "yes", "1", "cod"))
+    shopify_fu = sum(1 for r in all_r if "ful" in str(r.get("fulfilled", "")).lower())
+    today = datetime.now().strftime("%Y-%m-%d")
+    week_start = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    month_start = datetime.now().strftime("%Y-%m-01")
+    week_cut = datetime.strptime(week_start, "%Y-%m-%d").date()
+    month_cut = datetime.strptime(month_start, "%Y-%m-%d").date()
+    today_d = datetime.now().date()
+
+    today_orders = 0
+    week_orders = 0
+    month_orders = 0
+    for r in all_r:
+        d = _parse_row_date_for_filter(r.get("date"))
+        if d is None:
+            continue
+        if d == today_d:
+            today_orders += 1
+        if d >= week_cut:
+            week_orders += 1
+        if d >= month_cut:
+            month_orders += 1
+
+    proc_no_trk = [r for r in processed if not str(r.get("tracking_no", "")).strip()]
+    return {
+        "total": len(all_r),
+        "pending": len(pending),
+        "processing": len(proc_no_trk),
+        "shipped": with_trk,
+        "fulfilled": shopify_fu,
+        "failed": failed,
+        "mcf_count": mcf,
+        "delhivery_count": delh,
+        "cod_count": cod,
+        "prepaid_count": max(0, len(all_r) - cod),
+        "shopify_fulfilled": shopify_fu,
+        "with_tracking": with_trk,
+        "without_tracking": sum(1 for r in all_r if "MCF" in str(r.get("source", "")).upper() and not str(r.get("tracking_no", "")).strip()),
+        "today_orders": today_orders,
+        "week_orders": week_orders,
+        "month_orders": month_orders,
+        "avg_processing_hours": 0.0,
+    }
+
+
 # ─────────────────────────────────────────────
 # STAT CARD HELPER
 # ─────────────────────────────────────────────
@@ -264,7 +449,25 @@ def stat_card(col, label, value, color="#1f77b4"):
 # ─────────────────────────────────────────────
 def page_dashboard():
     st.title("📊 Dashboard")
-    stats = db.get_stats()
+    ensure_sheet_orders_loaded()
+    err = st.session_state.get("_endpoint_snapshot_error")
+    if err:
+        st.error(f"Sheet endpoint: {err}")
+
+    p_df = st.session_state.pending_df
+    r_df = st.session_state.processed_df
+    p_list = p_df.to_dict("records") if p_df is not None and not p_df.empty else []
+    r_list = r_df.to_dict("records") if r_df is not None and not r_df.empty else []
+
+    db_stats = db.get_stats()
+    sheet_stats = compute_sheet_dashboard_stats(p_list, r_list)
+    # Live sheet is source of truth for counts on Streamlit Cloud; DB enriches fulfilled orders.
+    stats = sheet_stats if (p_list or r_list) else db_stats
+    if (p_list or r_list) and db_stats.get("total", 0) > 0:
+        st.caption(
+            f"Top metrics from **Google Sheet** (cached ~2 min). "
+            f"App SQLite: **{db_stats['total']}** orders with fulfillment detail on this server."
+        )
 
     # Row 1
     cols = st.columns(4)
@@ -289,7 +492,11 @@ def page_dashboard():
     cols3[0].metric("Today's Orders", stats["today_orders"])
     cols3[1].metric("This Week", stats["week_orders"])
     cols3[2].metric("This Month", stats["month_orders"])
-    cols3[3].metric("Avg Processing (hrs)", stats["avg_processing_hours"])
+    aph = stats["avg_processing_hours"]
+    if not (p_list or r_list):
+        cols3[3].metric("Avg Processing (hrs)", aph)
+    else:
+        cols3[3].metric("Avg Processing (hrs)", aph, help="From SQLite only; sheet view has no dwell time.")
     cols3[4].metric("COD / Prepaid", f"{stats['cod_count']} / {stats['prepaid_count']}")
 
     st.markdown("---")
@@ -299,16 +506,24 @@ def page_dashboard():
     cols4[0].metric("With Tracking ID", stats["with_tracking"])
     cols4[1].metric("MCF Awaiting Tracking", stats["without_tracking"])
 
-    # Recent orders
+    # Recent orders (sheet-backed when available)
     st.subheader("Recent Orders")
-    recent = db.get_orders_filtered(limit=20)
-    if recent:
-        df = pd.DataFrame(recent)
-        show_cols = ["order_id", "customer_name", "status", "fulfillment_channel", "tracking_number", "created_at"]
-        show_cols = [c for c in show_cols if c in df.columns]
-        st.dataframe(df[show_cols], width='stretch', hide_index=True)
+    all_live = p_list + r_list
+    if all_live:
+        all_live = sorted(all_live, key=lambda x: str(x.get("date", "")), reverse=True)[:20]
+        rec_df = pd.DataFrame(all_live)
+        show_cols = ["order_id", "customer", "source", "tracking_no", "fulfilled", "date"]
+        show_cols = [c for c in show_cols if c in rec_df.columns]
+        st.dataframe(rec_df[show_cols], width="stretch", hide_index=True)
     else:
-        st.info("No orders in local DB yet. Go to Sync to fetch orders.")
+        recent = db.get_orders_filtered(limit=20)
+        if recent:
+            df = pd.DataFrame(recent)
+            show_cols = ["order_id", "customer_name", "status", "fulfillment_channel", "tracking_number", "created_at"]
+            show_cols = [c for c in show_cols if c in df.columns]
+            st.dataframe(df[show_cols], width='stretch', hide_index=True)
+        else:
+            st.info("No orders from sheet yet. Check Secrets / Apps Script URL or open **Orders**.")
 
 
 # ─────────────────────────────────────────────
@@ -316,8 +531,12 @@ def page_dashboard():
 # ─────────────────────────────────────────────
 def page_orders():
     st.title("📋 Orders")
+    ensure_sheet_orders_loaded()
+    if st.session_state.get("_endpoint_snapshot_error"):
+        st.warning(f"Sheet endpoint: {st.session_state._endpoint_snapshot_error}")
 
     if st.button("🔄 Refresh from Endpoint", type="primary"):
+        _cached_endpoint_snapshot.clear()
         with st.spinner("Fetching from Google Sheet endpoint..."):
             pending, processed, err = fetch_endpoint_orders()
             if err:
@@ -326,6 +545,7 @@ def page_orders():
                 st.session_state.pending_df = pd.DataFrame(pending) if pending else pd.DataFrame()
                 st.session_state.processed_df = pd.DataFrame(processed) if processed else pd.DataFrame()
                 st.session_state.processing_log = []
+                st.session_state._endpoint_snapshot_error = None
                 st.success(f"✅ Pending: {len(pending)} | Already Processed: {len(processed)}")
 
     tab1, tab2 = st.tabs(["⏳ Pending Orders", "✅ Already Processed"])
@@ -333,9 +553,7 @@ def page_orders():
     # ── TAB 1: PENDING ──────────────────────────────────────────────────
     with tab1:
         df = st.session_state.pending_df
-        if df is None:
-            st.info("Click 'Refresh from Endpoint' to load orders.")
-        elif df.empty:
+        if df is None or df.empty:
             st.success("🎉 No pending orders!")
         else:
             # Summary metrics
@@ -453,9 +671,7 @@ def page_orders():
     # ── TAB 2: ALREADY PROCESSED ────────────────────────────────────────
     with tab2:
         df2 = st.session_state.processed_df
-        if df2 is None:
-            st.info("Click 'Refresh from Endpoint' to load orders.")
-        elif df2.empty:
+        if df2 is None or df2.empty:
             st.info("No processed orders found.")
         else:
             show = ["order_id", "customer", "source", "fulfilled", "tracking_no", "carrier", "status"]
@@ -1198,6 +1414,14 @@ def _render_awb_fetch():
 # ─────────────────────────────────────────────
 def page_reports():
     st.title("📈 Reports & Export")
+    ensure_sheet_orders_loaded()
+    if st.session_state.get("_endpoint_snapshot_error"):
+        st.warning(f"Sheet: {st.session_state._endpoint_snapshot_error}")
+
+    st.caption(
+        "**Merged:** Google Sheet (Apps Script, ~2 min cache) + app **SQLite** `oms.db`. "
+        "Same `order_id` par DB row sheet ko override karti hai (fulfillment trail)."
+    )
 
     with st.expander("🔍 Filters", expanded=True):
         fc1, fc2, fc3 = st.columns(3)
@@ -1214,26 +1438,35 @@ def page_reports():
         date_from = dc1.date_input("From Date", value=None)
         date_to = dc2.date_input("To Date", value=None)
 
-    # Build filter args
     status_filter = None if "All" in sel_status or not sel_status else sel_status
     channel_filter = None if "All" in sel_channel or not sel_channel else sel_channel
 
-    orders = db.get_orders_filtered(
-        status=status_filter,
-        channel=channel_filter,
-        date_from=date_from,
-        date_to=date_to,
-        search=search or None,
-        limit=1000,
+    p_df = st.session_state.pending_df
+    r_df = st.session_state.processed_df
+    p_list = p_df.to_dict("records") if p_df is not None and not p_df.empty else []
+    r_list = r_df.to_dict("records") if r_df is not None and not r_df.empty else []
+    sheet_reports = [sheet_row_to_report_dict(row) for row in p_list + r_list]
+
+    db_pool = db.get_orders_filtered(
+        status=None,
+        channel=None,
+        date_from=None,
+        date_to=None,
+        search=None,
+        limit=8000,
+    )
+    merged = merge_db_and_sheet_reports(db_pool, sheet_reports)
+    orders = apply_report_filters_python(
+        merged, status_filter, channel_filter, date_from, date_to, search or None,
     )
 
     st.metric("Results", len(orders))
+    st.caption(f"Merged before filters: **{len(merged)}** rows (sheet + DB deduped).")
 
     if orders:
         df = pd.DataFrame(orders)
         st.dataframe(df, width='stretch', hide_index=True)
 
-        # CSV Export
         csv_buf = io.StringIO()
         df.to_csv(csv_buf, index=False)
         st.download_button(
@@ -1243,7 +1476,6 @@ def page_reports():
             mime="text/csv",
         )
 
-        # Excel Export
         try:
             excel_buf = io.BytesIO()
             with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
@@ -1257,7 +1489,15 @@ def page_reports():
         except Exception as e:
             st.warning(f"Excel export failed: {e}")
     else:
-        st.info("No orders match the selected filters.")
+        if not merged:
+            st.warning(
+                "Sheet se orders load nahi ho paaye aur DB bhi khaali hai. "
+                "Streamlit **Secrets** (Amazon/Delhivery/Shopify + endpoint) check karein; **Orders → Refresh** try karein."
+            )
+        else:
+            st.info(
+                f"Filters se koi row match nahi. (Merged total **{len(merged)}** — Status/Channel **All** ya dates khali karein.)"
+            )
 
 
 # ─────────────────────────────────────────────
@@ -1330,6 +1570,10 @@ def page_sync():
 
                     st.success(f"✅ Synced {added} new orders to local DB")
                     db.log_sync("MANUAL_SYNC", "SUCCESS", f"Added {added} orders")
+                    _cached_endpoint_snapshot.clear()
+                    st.session_state.pending_df = None
+                    st.session_state.processed_df = None
+                    st.session_state._endpoint_snapshot_error = None
 
             except Exception as e:
                 st.error(f"Sync failed: {e}")
@@ -1590,6 +1834,7 @@ def page_labels():
 # ─────────────────────────────────────────────
 # ROUTER
 # ─────────────────────────────────────────────
+ensure_sheet_orders_loaded()
 page = st.session_state.page
 if page == "Dashboard":
     page_dashboard()
