@@ -377,13 +377,9 @@ def build_pkg_from_sheet_and_delhivery(
     qty = row_get(order_row, i_qty) or "1"
 
     pairs, total_units = parse_sku_qty_pairs(sku, qty)
-    titles_split = [t.strip() for t in str(title or "").split(",") if str(title or "").strip()]
     sku_detail_lines: List[str] = []
     for i, (sk, q) in enumerate(pairs):
-        tit = titles_split[i] if i < len(titles_split) else ""
-        if tit:
-            sku_detail_lines.append(f"{sk} x{q} — {tit[:48]}")
-        elif sk:
+        if sk:
             sku_detail_lines.append(f"{sk} x{q}")
     if not sku_detail_lines and sku:
         sku_detail_lines.append(f"{sku.strip()} x{qty or '1'}")
