@@ -888,10 +888,16 @@ def _process_orders(full_df, selected, mcf_sel, del_sel):
                 raw_qty = str(row.get("raw_qty", row.get("qty", "1")))
                 qtys_str = [q.strip() for q in raw_qty.split(",") if q.strip()]
 
+                def parse_qty(q_str):
+                    try:
+                        return int(float(q_str))
+                    except ValueError:
+                        return 1
+
                 if len(qtys_str) == 1 and len(skus) > 1:
-                    qtys = [int(qtys_str[0])]*len(skus)
+                    qtys = [parse_qty(qtys_str[0])] * len(skus)
                 else:
-                    qtys = [int(q) if q.isdigit() else 1 for q in qtys_str]
+                    qtys = [parse_qty(q) for q in qtys_str]
 
                 while len(qtys) < len(skus):
                     qtys.append(1)
@@ -1051,21 +1057,21 @@ def _process_orders(full_df, selected, mcf_sel, del_sel):
 
     # ── SHEET UPDATES ────────────────────────────────────────────────────
     if sheet_updates:
-        status_text.text("Updating Google Sheet (Q/R columns)...")
+        status_text.text("Updating Google Sheet (R/S columns)...")
         try:
             update_sheet_remarks(sheets_service, SHEET_ID, sheet_updates)
             db.log_sync("SHEET_REMARKS", "SUCCESS", f"{len(sheet_updates)} rows updated")
         except Exception as e:
-            st.error(f"Sheet Q/R update failed: {e}")
+            st.error(f"Sheet R/S update failed: {e}")
             db.log_sync("SHEET_REMARKS", "ERROR", str(e)[:300])
 
     if sheet_tracking_updates:
-        status_text.text("Updating Google Sheet (S/T/U tracking columns)...")
+        status_text.text("Updating Google Sheet (T/U/V/W tracking columns)...")
         try:
             update_sheet_tracking(sheets_service, SHEET_ID, sheet_tracking_updates)
             db.log_sync("SHEET_TRACKING", "SUCCESS", f"{len(sheet_tracking_updates)} rows updated")
         except Exception as e:
-            st.error(f"Sheet S/T/U update failed: {e}")
+            st.error(f"Sheet T/U/V/W update failed: {e}")
 
     status_text.text("✅ Done!")
     progress.progress(1.0)
@@ -1097,8 +1103,9 @@ def _shopify_fulfill(order_id, shopify_cfg, tracking_info=None):
 
 
 def row_indicates_fulfilled_for_mcf_lookup(fulfilled_str: str) -> bool:
-    """Column R (fulfilled) must suggest fulfillment before we call MCF / Delhivery AWB APIs."""
-    return "ful" in (fulfilled_str or "").lower()
+    """Column S (fulfilled) must suggest fulfillment before we call MCF / Delhivery AWB APIs."""
+    s = (fulfilled_str or "").lower()
+    return "ful" in s or "plan" in s or "process" in s or "mcf" in s
 
 
 def _sync_shopify_fulfilled_row_to_sheet(order_id, row_number, row_source, shopify_cfg, sheets_service):
@@ -1449,7 +1456,7 @@ def _render_awb_fetch():
 
                     status_txt.text("Sheet update ho raha hai...")
 
-                    # Batch update S/T/U/V for orders WITH tracking
+                    # Batch update T/U/V/W for orders WITH tracking
                     if sheet_updates:
                         try:
                             for su in sheet_updates:
@@ -1457,16 +1464,16 @@ def _render_awb_fetch():
                             update_sheet_tracking(sheets_svc, SHEET_ID, sheet_updates)
                             db.log_sync("SHEET_TRACKING", "SUCCESS", f"{len(sheet_updates)} rows updated")
                         except Exception as e:
-                            st.error(f"Sheet S/T/U/V update failed: {e}")
+                            st.error(f"Sheet T/U/V/W update failed: {e}")
 
-                    # Batch update Q/R — FULFILLED when tracking found; R cleared when only planning/status in V
+                    # Batch update R/S — FULFILLED when tracking found; R cleared when only planning/status in V
                     all_qr = fulfilled_qr_updates + no_trk_remark_updates
                     if all_qr:
                         try:
                             update_sheet_remarks(sheets_svc, SHEET_ID, all_qr)
-                            db.log_sync("SHEET_REMARKS", "SUCCESS", f"{len(all_qr)} rows → Q/R updated")
+                            db.log_sync("SHEET_REMARKS", "SUCCESS", f"{len(all_qr)} rows → R/S updated")
                         except Exception as e:
-                            st.error(f"Sheet Q/R update failed: {e}")
+                            st.error(f"Sheet R/S update failed: {e}")
 
                     status_txt.text("✅ Done!")
                     prog.progress(1.0)
