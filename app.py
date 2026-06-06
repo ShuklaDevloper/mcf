@@ -1833,16 +1833,19 @@ def page_shopify_tools():
         except Exception as e:
             return {}, None
 
-    tab1, tab2 = st.tabs(["✅ Direct Fulfill", "🚚 Add / Update Tracking"])
+    tab1, tab2 = st.tabs(["✅ MCF Fulfill", "🚚 Add / Update Tracking"])
 
     shopify_cfg = get_shopify_config(secrets)
 
     with tab1:
-        st.subheader("Bulk Mark Orders as Fulfilled")
-        st.write("Order IDs daalein (comma separated ya naye line mein). Shopify par bina tracking ke fulfill ho jayenge aur Sheet mein update ho jayenge.")
-        order_ids_input = st.text_area("Order IDs", height=150, key="tab1_oids", placeholder="2860\n2861\n2862")
+        st.subheader("MCF — Bulk Mark Fulfilled (Shopify + Sheet)")
+        st.write(
+            "Order IDs daalein. Shopify par fulfill hoga aur sheet mein "
+            "**Q = MCF**, **R = FULFILLED** likha jayega (tracking optional)."
+        )
+        order_ids_input = st.text_area("Order IDs", height=150, key="tab1_oids", placeholder="2860\n2861\n5862")
         
-        if st.button("Mark Fulfilled", type="primary"):
+        if st.button("MCF Fulfill on Shopify", type="primary"):
             if not order_ids_input.strip():
                 st.warning("Please enter at least one Order ID.")
             else:
@@ -1865,9 +1868,11 @@ def page_shopify_tools():
                             if success and service and oid in row_map:
                                 sheet_updates_qr.append({
                                     "row": row_map[oid],
-                                    "source": "Manual",
-                                    "status": "FULFILLED"
+                                    "source": "MCF",
+                                    "status": "FULFILLED",
                                 })
+                            elif success and service and oid not in row_map:
+                                results[-1]["Message"] = f"{msg} | Sheet: order not in row map"
                         else:
                             results.append({"Order ID": oid, "Status": "❌ Error", "Message": "Not found on Shopify"})
                         
@@ -1876,7 +1881,9 @@ def page_shopify_tools():
                     if sheet_updates_qr and service:
                         try:
                             update_sheet_remarks(service, SHEET_ID, sheet_updates_qr)
-                            st.success(f"✅ Updated {len(sheet_updates_qr)} rows in Google Sheet (Q/R columns).")
+                            st.success(
+                                f"✅ Sheet updated: {len(sheet_updates_qr)} row(s) — Q=MCF, R=FULFILLED."
+                            )
                         except Exception as e:
                             st.warning(f"Sheet update failed: {e}")
                     
