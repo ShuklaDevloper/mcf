@@ -48,9 +48,12 @@ def read_secret(file_name="secret.txt"):
 
     try:
         import streamlit as st
-        for k, v in st.secrets.items():
-            if k not in secrets and isinstance(v, str):
-                secrets[k] = v
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+        if get_script_run_ctx() is not None:
+            for k, v in st.secrets.items():
+                if k not in secrets and isinstance(v, str):
+                    secrets[k] = v
     except Exception:
         pass
 
@@ -140,22 +143,97 @@ def parse_date(date_str):
 # ─────────────────────────────────────────────
 # GOOGLE SHEETS
 # ─────────────────────────────────────────────
-def init_sheets_service():
-    """Build Google Sheets API service from hide.json service account."""
+def _load_google_credentials(secrets=None):
+    """Load Google service account creds from hide.json, secret.txt path, or Streamlit."""
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    creds_path = os.path.join(script_dir, "hide.json")
-    
-    if os.path.exists(creds_path):
-        creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
-    else:
-        try:
-            import streamlit as st
-            creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
-        except Exception as e:
-            raise Exception("hide.json missing, and st.secrets['gcp_service_account'] not found: " + str(e))
-            
+    if secrets is None:
+        secrets = read_secret()
+
+    creds_file = (
+        secrets.get("GOOGLE_CREDS_FILE")
+        or secrets.get("HIDE_JSON")
+        or secrets.get("GCP_CREDS_FILE")
+        or "hide.json"
+    )
+    if not os.path.isabs(creds_file):
+        creds_file = os.path.join(script_dir, creds_file)
+    if os.path.exists(creds_file):
+        return Credentials.from_service_account_file(creds_file, scopes=scopes)
+
+    json_str = (secrets.get("GCP_SERVICE_ACCOUNT_JSON") or "").strip()
+    if json_str.startswith("{"):
+        return Credentials.from_service_account_info(json.loads(json_str), scopes=scopes)
+
+    try:
+        import streamlit as st
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+        if get_script_run_ctx() is not None and "gcp_service_account" in st.secrets:
+            return Credentials.from_service_account_info(
+                dict(st.secrets["gcp_service_account"]), scopes=scopes
+            )
+    except Exception:
+        pass
+
+    raise FileNotFoundError(
+        "Google Sheets credentials missing. Place hide.json in the project folder, "
+        "or add GOOGLE_CREDS_FILE=path/to/key.json in secret.txt."
+    )
+
+
+def init_sheets_service(secrets=None):
+    """Build Google Sheets API service."""
+    creds = _load_google_credentials(secrets)
     return build("sheets", "v4", credentials=creds)
+
+
+def fetch_orders_from_apps_script(timeout=30):
+    """Load all orders from the Apps Script endpoint (no Sheets API creds needed)."""
+    resp = requests.get(APPS_SCRIPT_URL, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("success"):
+        return []
+    return data.get("orders", [])
+
+
+def get_order_awb(order):
+    """Return AWB/tracking number from Apps Script order payload."""
+    awb = str(order.get("carrier", "")).strip()
+    label = str(order.get("tracking_no", "")).strip()
+    # Apps Script maps AWB -> carrier, carrier company -> tracking_no
+    if awb and len(awb) >= 8 and awb.lower() not in {
+        "delhivery", "amazon transportation services", "ithink logistics", "mcf",
+    }:
+        return awb
+    if label and len(label) >= 8 and label.lower() not in {
+        "delhivery", "amazon transportation services", "ithink logistics", "mcf",
+    }:
+        return label
+    return ""
+
+
+def build_order_row_map(orders):
+    """Map order ID -> sheet row number from Apps Script order list."""
+    row_map = {}
+    for o in orders:
+        oid = str(o.get("ord_serial", "")).replace("#", "").strip()
+        row_num = int(o.get("row_number", 0) or 0)
+        if oid and row_num:
+            row_map[oid] = row_num
+    return row_map
+
+
+def build_tracking_row_map(orders):
+    """Map tracking number -> sheet row number from Apps Script order list."""
+    row_map = {}
+    for o in orders:
+        awb = get_order_awb(o)
+        row_num = int(o.get("row_number", 0) or 0)
+        if awb and row_num:
+            row_map[awb] = row_num
+    return row_map
 
 
 def ensure_sheet_capacity(service, sheet_id, max_row_needed):
@@ -214,8 +292,13 @@ def infer_sheet_source_q(carrier: str, tracking_no: str = "") -> str:
     if "shiprocket" in c.replace(" ", ""):
         return "Shiprocket"
 
-    # Shopify often leaves carrier blank; long numeric AWB is common for Delhivery (India).
+    # Shopify often leaves carrier blank; infer from AWB pattern.
     if not car or c in ("shopify", "other", "custom"):
+        up = tn.upper()
+        if up.startswith(("ILS", "ILSC", "ILSP", "I79")):
+            return "iThink"
+        if tn.isdigit() and len(tn) == 12:
+            return "MCF"
         if tn.isdigit() and 10 <= len(tn) <= 15:
             return "Delhivery"
         return "Manual"
@@ -223,8 +306,129 @@ def infer_sheet_source_q(carrier: str, tracking_no: str = "") -> str:
     return car[:50]
 
 
+def build_tracking_url(carrier: str, tracking_no: str) -> str:
+    """Build public tracking URL from carrier + AWB (Delhivery / iThink / Swiship)."""
+    tn = (tracking_no or "").strip()
+    if not tn:
+        return ""
+    src = infer_sheet_source_q(carrier, tn)
+    if src == "Delhivery":
+        return f"https://www.delhivery.com/track/package/{tn}"
+    if src == "iThink":
+        return f"https://ithinklogistics.com/track/{tn}"
+    if src == "MCF":
+        return f"https://www.swiship.co.uk/track?id={tn}"
+    up = tn.upper()
+    if tn.isdigit() and len(tn) >= 14:
+        return f"https://www.delhivery.com/track/package/{tn}"
+    if up.startswith(("ILS", "ILSC", "ILSP", "I79")):
+        return f"https://ithinklogistics.com/track/{tn}"
+    if tn.isdigit() and len(tn) == 12:
+        return f"https://www.swiship.co.uk/track?id={tn}"
+    return ""
+
+
+def format_sheet_cell_value(val):
+    """Preserve full numeric AWBs from Sheets (avoid 1.32E+12 corruption)."""
+    if val is None:
+        return ""
+    if isinstance(val, bool):
+        return str(val)
+    if isinstance(val, int):
+        return str(val)
+    if isinstance(val, float):
+        if val == int(val):
+            return str(int(val))
+        return format(val, "f").rstrip("0").rstrip(".")
+    s = str(val).strip()
+    low = s.lower()
+    if re.match(r"^\d+\.?\d*e[+-]\d+$", low):
+        try:
+            f = float(s)
+            if f == int(f):
+                return str(int(f))
+        except (ValueError, OverflowError):
+            pass
+    return s
+
+
+def batch_update_sheet_ranges(service, sheet_id, data, chunk_size=60, retries=3, pause_sec=0.35):
+    """Write many A1 range updates with chunking + retry (429/503 safe for 1000+ rows)."""
+    import time
+
+    if not data:
+        return 0
+    written = 0
+    for i in range(0, len(data), chunk_size):
+        chunk = data[i : i + chunk_size]
+        last_err = None
+        for attempt in range(retries):
+            try:
+                srv = service
+                if srv is None:
+                    srv = init_sheets_service()
+                srv.spreadsheets().values().batchUpdate(
+                    spreadsheetId=sheet_id,
+                    body={"valueInputOption": "RAW", "data": chunk},
+                ).execute()
+                written += len(chunk)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < retries - 1:
+                    time.sleep(min(8, 1.5 * (2**attempt)))
+                else:
+                    raise last_err
+        if pause_sec:
+            time.sleep(pause_sec)
+    return written
+
+
+def batch_update_tracking_rows(service, sheet_id, updates):
+    """Write tracking row to fixed columns Q–AB.
+
+    Q=Source, R=FULFILLED, S=Carrier, T=tracking no, U=url, V=Status,
+    X=ETA, Y=Pickup, Z=Delivery, AA=Last Status, AB=RTO
+    """
+    if not updates:
+        return
+    max_row = max(u["row"] for u in updates)
+    ensure_sheet_capacity(service, sheet_id, max_row)
+    data = []
+    for u in updates:
+        row = u["row"]
+        if u.get("source"):
+            data.append({"range": f"Sheet1!Q{row}", "values": [[u["source"]]]})
+        if u.get("fulfilled"):
+            data.append({"range": f"Sheet1!R{row}", "values": [[u["fulfilled"]]]})
+        if u.get("carrier"):
+            data.append({"range": f"Sheet1!S{row}", "values": [[u["carrier"]]]})
+        if u.get("tracking_no"):
+            data.append({"range": f"Sheet1!T{row}", "values": [[u["tracking_no"]]]})
+        if u.get("url"):
+            data.append({"range": f"Sheet1!U{row}", "values": [[u["url"]]]})
+        if u.get("status"):
+            data.append({"range": f"Sheet1!V{row}", "values": [[u["status"]]]})
+        if u.get("eta"):
+            data.append({"range": f"Sheet1!X{row}", "values": [[u["eta"]]]})
+        if u.get("pickup"):
+            data.append({"range": f"Sheet1!Y{row}", "values": [[u["pickup"]]]})
+        if u.get("delivery"):
+            data.append({"range": f"Sheet1!Z{row}", "values": [[u["delivery"]]]})
+        if u.get("last_status"):
+            data.append({"range": f"Sheet1!AA{row}", "values": [[u["last_status"]]]})
+        if u.get("rto"):
+            data.append({"range": f"Sheet1!AB{row}", "values": [[u["rto"]]]})
+    if data:
+        service.spreadsheets().values().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"valueInputOption": "RAW", "data": data},
+        ).execute()
+
+
 def update_sheet_remarks(service, sheet_id, updates):
-    """Batch update columns Q (source) and R (status) for given row numbers.
+    """Batch update columns Q (Source) and R (FULFILLED).
     updates = [{"row": 2, "source": "MCF", "status": "Fulfilled"}, ...]
     """
     if not updates:
@@ -245,25 +449,21 @@ def update_sheet_remarks(service, sheet_id, updates):
 
 
 def update_sheet_tracking(service, sheet_id, updates):
-    """Batch update columns S (carrier), T (tracking_no), U (tracking_url), V (remark).
-    Also writes Q (Source) when ``tracking_no`` is non-empty — use ``source=`` to force,
-    or ``fill_source_q=False`` to skip Q (e.g. when Q/R just updated in same flow).
-
-    updates = [{"row": 2, "carrier": "...", "tracking_no": "...", "url": "...", "remark": "..."}, ...]
+    """Batch update S (carrier), T (tracking), U (url), V (status).
+    Also writes Q (Source) when ``tracking_no`` is set unless ``fill_source_q=False``.
     """
     if not updates:
         return
     max_row = max(u['row'] for u in updates)
     ensure_sheet_capacity(service, sheet_id, max_row)
-    from datetime import datetime
-    now_str = datetime.now().strftime("%d/%m %H:%M")
     data = []
     for u in updates:
         tn = u.get("tracking_no", "")
-        remark = u.get("remark") or (f"Tracking Added {now_str}" if tn else u.get("mcf_status", "Pending"))
+        status_val = u.get("status") or u.get("remark") or ""
+        url = u.get("url") or build_tracking_url(u.get("carrier", ""), tn)
         data.append({
             "range": f"Sheet1!S{u['row']}:V{u['row']}",
-            "values": [[u.get("carrier", ""), tn, u.get("url", ""), remark]],
+            "values": [[u.get("carrier", ""), tn, url, status_val]],
         })
         fill_q = u.get("fill_source_q", True)
         if fill_q and str(tn).strip():
@@ -279,6 +479,26 @@ def update_sheet_tracking(service, sheet_id, updates):
         spreadsheetId=sheet_id,
         body={"valueInputOption": "RAW", "data": data},
     ).execute()
+
+
+def update_sheet_fulfilled_only(service, sheet_id, updates):
+    """Update R (FULFILLED) and V (Status) — keeps Q Source unchanged."""
+    if not updates:
+        return
+    max_row = max(u["row"] for u in updates)
+    ensure_sheet_capacity(service, sheet_id, max_row)
+    data = []
+    for u in updates:
+        row = u["row"]
+        if u.get("fulfilled"):
+            data.append({"range": f"Sheet1!R{row}", "values": [[u["fulfilled"]]]})
+        if u.get("status"):
+            data.append({"range": f"Sheet1!V{row}", "values": [[u["status"]]]})
+    if data:
+        service.spreadsheets().values().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"valueInputOption": "RAW", "data": data},
+        ).execute()
 
 
 # ─────────────────────────────────────────────
