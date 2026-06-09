@@ -1454,7 +1454,6 @@ def _render_awb_fetch():
                             order_id,
                             secrets=secrets,
                             mcf_token=token,
-                            allow_ithink_scan=False,
                         )
 
                         if tn:
