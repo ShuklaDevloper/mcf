@@ -1225,7 +1225,7 @@ def _awb_fetch_process_one(order, secrets, token, shopify_cfg):
     qr_fail = {
         "row": order["row_number"],
         "source": "Delhivery" if "DELHI" in orig_source else "MCF",
-        "status": "",
+        "status": "FULFILLED",
     }
     return ({
         "Order ID": order_id,
