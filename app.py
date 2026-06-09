@@ -1108,6 +1108,189 @@ def row_indicates_fulfilled_for_mcf_lookup(fulfilled_str: str) -> bool:
     return "ful" in s or "plan" in s or "process" in s or "mcf" in s
 
 
+def row_indicates_fulfilled_for_mcf_lookup(fulfilled_str: str) -> bool:
+    """Column S (fulfilled) must suggest fulfillment before we call MCF / Delhivery AWB APIs."""
+    s = (fulfilled_str or "").lower()
+    return "ful" in s or "plan" in s or "process" in s or "mcf" in s
+
+
+AWB_FETCH_BATCH_SIZE = 10
+AWB_LOOKUP_TIMEOUT_SEC = 22
+
+
+def _lookup_awb_with_timeout(order_id, secrets, mcf_token, timeout_sec=AWB_LOOKUP_TIMEOUT_SEC):
+    """Cap per-order lookup so Streamlit never hangs 90s+ on slow iThink scan."""
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
+
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(
+            lookup_awb_by_order_id,
+            order_id,
+            secrets=secrets,
+            mcf_token=mcf_token,
+        )
+        try:
+            return fut.result(timeout=timeout_sec)
+        except FutTimeout:
+            return "", "", "", f"Timeout ({timeout_sec}s) — deploy latest live_tracker.py"
+
+
+def _awb_fetch_flush_buffers(sheets_svc, track_buf, qr_ok_buf, qr_fail_buf):
+    if track_buf:
+        for su in track_buf:
+            su["fill_source_q"] = False
+        update_sheet_tracking(sheets_svc, SHEET_ID, track_buf)
+    all_qr = qr_ok_buf + qr_fail_buf
+    if all_qr:
+        update_sheet_remarks(sheets_svc, SHEET_ID, all_qr)
+
+
+def _awb_fetch_process_one(order, secrets, token, shopify_cfg):
+    """Process single pending order; return (result_row, track_upd, qr_ok, qr_fail)."""
+    order_id = order["order_id"]
+    track_upd = qr_ok = qr_fail = None
+
+    if not row_indicates_fulfilled_for_mcf_lookup(order.get("fulfilled", "")):
+        return ({
+            "Order ID": order_id,
+            "Customer": order["customer"],
+            "Status": "Skipped — column R has no 'ful'",
+            "Tracking ID": "—",
+            "Carrier": "—",
+            "Shopify": "—",
+            "Sheet": "— (unchanged)",
+        }, None, None, None)
+
+    tn, cc, src_label, detail_status = _lookup_awb_with_timeout(
+        order_id, secrets=secrets, mcf_token=token
+    )
+
+    if tn:
+        remark = f"Tracking Added {datetime.now().strftime('%d/%m %H:%M')}"
+        if detail_status and detail_status not in (
+            "Found on iThink", "Found on Delhivery", "Found on MCF"
+        ):
+            remark = f"{remark} | {detail_status}"
+        db.update_order_tracking(order_id, cc or src_label, tn, "")
+        t_info = {
+            "number": tn,
+            "company": cc or src_label,
+            "url": build_tracking_url(cc or src_label, tn),
+        }
+        try:
+            s_ok, s_msg = _shopify_fulfill(order_id, shopify_cfg, tracking_info=t_info)
+        except Exception as e:
+            s_ok, s_msg = False, str(e)[:80]
+
+        sheet_src = src_label or infer_sheet_source_q(cc, tn)
+        track_upd = {
+            "row": order["row_number"],
+            "carrier": cc or src_label,
+            "tracking_no": tn,
+            "url": t_info.get("url", ""),
+            "remark": remark,
+        }
+        qr_ok = {"row": order["row_number"], "source": sheet_src, "status": "FULFILLED"}
+        return ({
+            "Order ID": order_id,
+            "Customer": order["customer"],
+            "Status": detail_status or src_label,
+            "Tracking ID": tn,
+            "Carrier": cc or src_label,
+            "Shopify": "✅ Fulfilled" if s_ok else f"⚠️ {s_msg}",
+            "Sheet": "✅ Updated",
+        }, track_upd, qr_ok, qr_fail)
+
+    orig_source = str(order.get("source", "")).upper()
+    if "DELHI" in orig_source:
+        status_label = "Delhivery: Not Found"
+    else:
+        status_label = {
+            "Planning": "MCF: Planning",
+            "Received": "MCF: Received",
+            "Processing": "MCF: Processing",
+            "Complete": "MCF: Complete",
+            "Cancelled": "MCF: Cancelled",
+            "NotFound": "MCF: Not Found",
+            "Unfulfillable": "MCF: Unfulfillable",
+        }.get(detail_status, f"MCF: {detail_status}" if detail_status else "Not Found")
+
+    track_upd = {
+        "row": order["row_number"],
+        "carrier": "",
+        "tracking_no": "",
+        "url": "",
+        "remark": status_label,
+    }
+    qr_fail = {
+        "row": order["row_number"],
+        "source": "Delhivery" if "DELHI" in orig_source else "MCF",
+        "status": "",
+    }
+    return ({
+        "Order ID": order_id,
+        "Customer": order["customer"],
+        "Status": detail_status or status_label,
+        "Tracking ID": "—",
+        "Carrier": "—",
+        "Shopify": "—",
+        "Sheet": f"✅ V: {status_label}",
+    }, track_upd, qr_ok, qr_fail)
+
+
+def _awb_fetch_run_batch(secrets, progress_slot, status_slot):
+    """Process next AWB_FETCH_BATCH_SIZE orders; auto-continue via session state."""
+    queue = st.session_state.get("awb_fetch_queue") or []
+    idx = int(st.session_state.get("awb_fetch_idx") or 0)
+    total = len(queue)
+    if total == 0 or idx >= total:
+        st.session_state.awb_fetch_running = False
+        return True
+
+    token, err = get_fresh_token()
+    if err:
+        st.error(f"Auth failed: {err}")
+        st.session_state.awb_fetch_running = False
+        return True
+
+    shopify_cfg = get_shopify_config(secrets)
+    try:
+        sheets_svc = init_sheets_service()
+    except Exception as e:
+        st.error(f"Sheets init failed: {e}")
+        st.session_state.awb_fetch_running = False
+        return True
+
+    results = st.session_state.setdefault("awb_fetch_results", [])
+    track_buf = []
+    qr_ok_buf = []
+    qr_fail_buf = []
+
+    end = min(idx + AWB_FETCH_BATCH_SIZE, total)
+    for i in range(idx, end):
+        order = queue[i]
+        status_slot.text(
+            f"Order {order['order_id']} ({i + 1}/{total}) — iThink → Delhivery → MCF..."
+        )
+        progress_slot.progress((i + 1) / total)
+        row, tr, qok, qfail = _awb_fetch_process_one(order, secrets, token, shopify_cfg)
+        results.append(row)
+        if tr:
+            track_buf.append(tr)
+        if qok:
+            qr_ok_buf.append(qok)
+        if qfail:
+            qr_fail_buf.append(qfail)
+
+    try:
+        _awb_fetch_flush_buffers(sheets_svc, track_buf, qr_ok_buf, qr_fail_buf)
+    except Exception as e:
+        st.warning(f"Sheet batch save failed: {e}")
+
+    st.session_state.awb_fetch_idx = end
+    return end >= total
+
+
 def _sync_shopify_fulfilled_row_to_sheet(order_id, row_number, row_source, shopify_cfg, sheets_service):
     """Shopify already fulfilled: pull fulfillments, sync S/T/U/V and Q/R (R=FULFILLED). Returns (ok, message, tracking_or_none)."""
     s_order = get_shopify_order(order_id, shopify_cfg["headers"], shopify_cfg["shop_url"])
@@ -1389,174 +1572,56 @@ def _render_awb_fetch():
             st.markdown("---")
             btn_col1, btn_col2 = st.columns([2, 3])
             st.caption(
-                "Har 15 orders ke baad sheet auto-save. Agar purana run atka dikhe to upar **Stop** dabao, "
-                "phir page refresh karke dubara Fetch chalao."
+                f"Har {AWB_FETCH_BATCH_SIZE} orders ke baad auto-save + page reload (Streamlit timeout se bachne ke liye). "
+                "Atka dikhe to **Stop** → refresh → dubara Fetch."
             )
 
-            # ── FETCH ALL button ──────────────────────────────────────────
-            if btn_col1.button("🔍 Fetch Tracking for All", type="primary", key="fetch_all_btn"):
-                token, err = get_fresh_token()
-                if err:
-                    st.error(f"Auth failed: {err}")
-                else:
-                    shopify_cfg = get_shopify_config(secrets)
-                    try:
-                        sheets_svc = init_sheets_service()
-                    except Exception as e:
-                        st.error(f"Sheets init failed: {e}")
-                        return
-
-                    sheet_updates        = []   # S/T/U/V — tracking + status remark
-                    no_trk_remark_updates = []  # Q/R — R empty for planning; FULFILLED when tracking found
-                    fulfilled_qr_updates  = []  # Q/R = FULFILLED when AWB fetch succeeds
-                    result_rows          = []
-                    prog = st.progress(0)
-                    status_txt = st.empty()
-                    total = len(need_trk)
-
-                    def _flush_awb_batches(force=False):
-                        nonlocal sheet_updates, fulfilled_qr_updates, no_trk_remark_updates, sheets_svc
-                        pending = len(sheet_updates) + len(fulfilled_qr_updates) + len(no_trk_remark_updates)
-                        if not force and pending < 15:
-                            return
-                        if sheet_updates:
-                            for su in sheet_updates:
-                                su["fill_source_q"] = False
-                            update_sheet_tracking(sheets_svc, SHEET_ID, sheet_updates)
-                            sheet_updates = []
-                        all_qr = fulfilled_qr_updates + no_trk_remark_updates
-                        if all_qr:
-                            update_sheet_remarks(sheets_svc, SHEET_ID, all_qr)
-                            fulfilled_qr_updates = []
-                            no_trk_remark_updates = []
-
-                    for i, order in enumerate(need_trk):
-                        order_id = order["order_id"]
-                        orig_source = str(order.get("source", "")).upper()
-                        status_txt.text(
-                            f"Order {order_id} ({i + 1}/{total}) — iThink → Delhivery → MCF..."
-                        )
-
-                        if not row_indicates_fulfilled_for_mcf_lookup(order.get("fulfilled", "")):
-                            result_rows.append({
-                                "Order ID": order_id,
-                                "Customer": order["customer"],
-                                "Status": "Skipped — column R has no 'ful'",
-                                "Tracking ID": "—",
-                                "Carrier": "—",
-                                "Shopify": "—",
-                                "Sheet": "— (unchanged)",
-                            })
-                            prog.progress((i + 1) / total)
-                            continue
-
-                        tn, cc, src_label, detail_status = lookup_awb_by_order_id(
-                            order_id,
-                            secrets=secrets,
-                            mcf_token=token,
-                        )
-
-                        if tn:
-                            from datetime import datetime as _dt
-                            remark = f"Tracking Added {_dt.now().strftime('%d/%m %H:%M')}"
-                            if detail_status and detail_status not in ("Found on iThink", "Found on Delhivery", "Found on MCF"):
-                                remark = f"{remark} | {detail_status}"
-                            db.update_order_tracking(order_id, cc or src_label, tn, "")
-                            t_info = {
-                                "number": tn,
-                                "company": cc or src_label,
-                                "url": build_tracking_url(cc or src_label, tn),
-                            }
-                            s_ok, s_msg = _shopify_fulfill(order_id, shopify_cfg, tracking_info=t_info)
-
-                            sheet_src = src_label or infer_sheet_source_q(cc, tn)
-                            sheet_updates.append({
-                                "row": order["row_number"],
-                                "carrier": cc or src_label,
-                                "tracking_no": tn,
-                                "url": t_info.get("url", ""),
-                                "remark": remark,
-                            })
-                            fulfilled_qr_updates.append({
-                                "row": order["row_number"],
-                                "source": sheet_src,
-                                "status": "FULFILLED",
-                            })
-                            result_rows.append({
-                                "Order ID": order_id,
-                                "Customer": order["customer"],
-                                "Status": detail_status or src_label,
-                                "Tracking ID": tn,
-                                "Carrier": cc or src_label,
-                                "Shopify": "✅ Fulfilled" if s_ok else f"⚠️ {s_msg}",
-                                "Sheet": "✅ Updated",
-                            })
-                        else:
-                            orig_source = str(order.get("source", "")).upper()
-                            if "DELHI" in orig_source:
-                                status_label = "Delhivery: Not Found"
-                                mcf_status = detail_status or "NotFound"
-                            else:
-                                status_label = {
-                                    "Planning": "MCF: Planning",
-                                    "Received": "MCF: Received",
-                                    "Processing": "MCF: Processing",
-                                    "Complete": "MCF: Complete",
-                                    "Cancelled": "MCF: Cancelled",
-                                    "NotFound": "MCF: Not Found",
-                                    "Unfulfillable": "MCF: Unfulfillable",
-                                }.get(detail_status, f"MCF: {detail_status}" if detail_status else "Not Found")
-
-                            sheet_updates.append({
-                                "row": order["row_number"],
-                                "carrier": "",
-                                "tracking_no": "",
-                                "url": "",
-                                "remark": status_label,
-                            })
-                            no_trk_remark_updates.append({
-                                "row": order["row_number"],
-                                "source": "Delhivery" if "DELHI" in orig_source else "MCF",
-                                "status": "",
-                            })
-                            result_rows.append({
-                                "Order ID": order_id,
-                                "Customer": order["customer"],
-                                "Status": detail_status or status_label,
-                                "Tracking ID": "—",
-                                "Carrier": "—",
-                                "Shopify": "—",
-                                "Sheet": f"✅ V: {status_label}",
-                            })
-
-                        prog.progress((i + 1) / total)
-                        _flush_awb_batches()
-                        time.sleep(0.2)
-
-                    status_txt.text("Sheet update ho raha hai...")
-                    _flush_awb_batches(force=True)
-
-                    if sheet_updates or fulfilled_qr_updates or no_trk_remark_updates:
-                        db.log_sync(
-                            "SHEET_TRACKING",
-                            "SUCCESS",
-                            f"Fetch-all flush complete ({len(result_rows)} rows processed)",
-                        )
-
-                    status_txt.text("✅ Done!")
-                    prog.progress(1.0)
-
-                    # Results summary
-                    found_count = sum(1 for r in result_rows if r["Tracking ID"] != "—")
+            if st.session_state.get("awb_fetch_running"):
+                prog_run = st.progress(
+                    int(st.session_state.get("awb_fetch_idx") or 0)
+                    / max(len(st.session_state.get("awb_fetch_queue") or []), 1)
+                )
+                status_run = st.empty()
+                done = _awb_fetch_run_batch(secrets, prog_run, status_run)
+                if done:
+                    st.session_state.awb_fetch_running = False
+                    results = st.session_state.get("awb_fetch_results") or []
+                    total_done = len(st.session_state.get("awb_fetch_queue") or [])
+                    found_count = sum(
+                        1 for r in results if r.get("Tracking ID") not in ("—", "")
+                    )
+                    status_run.text("✅ Done!")
+                    prog_run.progress(1.0)
                     st.subheader("Tracking Fetch Results")
                     rc1, rc2 = st.columns(2)
                     rc1.metric("Tracking Found", found_count)
-                    rc2.metric("Still Pending", total - found_count)
-                    st.dataframe(pd.DataFrame(result_rows), width='stretch', hide_index=True)
-
-                    # Reload orders
+                    rc2.metric("Still Pending", total_done - found_count)
+                    if results:
+                        st.dataframe(pd.DataFrame(results), width="stretch", hide_index=True)
                     st.session_state.tracking_sheet_orders = None
                     st.info("Reload ke liye upar 'Load MCF Orders from Sheet' dobara click karo.")
+                else:
+                    time.sleep(0.3)
+                    st.rerun()
+
+            if btn_col1.button(
+                "🔍 Fetch Tracking for All",
+                type="primary",
+                key="fetch_all_btn",
+                disabled=bool(st.session_state.get("awb_fetch_running")),
+            ):
+                st.session_state.awb_fetch_running = True
+                st.session_state.awb_fetch_idx = 0
+                st.session_state.awb_fetch_results = []
+                st.session_state.awb_fetch_queue = list(need_trk)
+                st.rerun()
+
+            if st.session_state.get("awb_fetch_running") and btn_col2.button(
+                "⏹ Cancel Fetch", key="cancel_awb_fetch"
+            ):
+                st.session_state.awb_fetch_running = False
+                st.session_state.pop("awb_fetch_queue", None)
+                st.rerun()
 
             # ── SINGLE ORDER manual check ─────────────────────────────────
             with btn_col2:
@@ -1567,7 +1632,7 @@ def _render_awb_fetch():
                         if token2:
                             oid = manual_id.strip().replace("#", "")
                             st.write("**Lookup:** iThink → Delhivery → MCF")
-                            tn, cc, src_label, detail = lookup_awb_by_order_id(
+                            tn, cc, src_label, detail = _lookup_awb_with_timeout(
                                 oid, secrets=secrets, mcf_token=token2
                             )
                             st.write(f"**Result:** `{detail or 'Not found'}` | Source: **{src_label or '—'}**")
