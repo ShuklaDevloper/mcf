@@ -1388,6 +1388,10 @@ def _render_awb_fetch():
 
             st.markdown("---")
             btn_col1, btn_col2 = st.columns([2, 3])
+            st.caption(
+                "Har 15 orders ke baad sheet auto-save. Agar purana run atka dikhe to upar **Stop** dabao, "
+                "phir page refresh karke dubara Fetch chalao."
+            )
 
             # ── FETCH ALL button ──────────────────────────────────────────
             if btn_col1.button("🔍 Fetch Tracking for All", type="primary", key="fetch_all_btn"):
@@ -1410,10 +1414,28 @@ def _render_awb_fetch():
                     status_txt = st.empty()
                     total = len(need_trk)
 
+                    def _flush_awb_batches(force=False):
+                        nonlocal sheet_updates, fulfilled_qr_updates, no_trk_remark_updates, sheets_svc
+                        pending = len(sheet_updates) + len(fulfilled_qr_updates) + len(no_trk_remark_updates)
+                        if not force and pending < 15:
+                            return
+                        if sheet_updates:
+                            for su in sheet_updates:
+                                su["fill_source_q"] = False
+                            update_sheet_tracking(sheets_svc, SHEET_ID, sheet_updates)
+                            sheet_updates = []
+                        all_qr = fulfilled_qr_updates + no_trk_remark_updates
+                        if all_qr:
+                            update_sheet_remarks(sheets_svc, SHEET_ID, all_qr)
+                            fulfilled_qr_updates = []
+                            no_trk_remark_updates = []
+
                     for i, order in enumerate(need_trk):
                         order_id = order["order_id"]
                         orig_source = str(order.get("source", "")).upper()
-                        status_txt.text(f"Checking {order_id} ({i+1}/{total})...")
+                        status_txt.text(
+                            f"Order {order_id} ({i + 1}/{total}) — iThink → Delhivery → MCF..."
+                        )
 
                         if not row_indicates_fulfilled_for_mcf_lookup(order.get("fulfilled", "")):
                             result_rows.append({
@@ -1429,7 +1451,10 @@ def _render_awb_fetch():
                             continue
 
                         tn, cc, src_label, detail_status = lookup_awb_by_order_id(
-                            order_id, secrets=secrets, mcf_token=token
+                            order_id,
+                            secrets=secrets,
+                            mcf_token=token,
+                            allow_ithink_scan=False,
                         )
 
                         if tn:
@@ -1506,28 +1531,18 @@ def _render_awb_fetch():
                             })
 
                         prog.progress((i + 1) / total)
-                        time.sleep(0.35)
+                        _flush_awb_batches()
+                        time.sleep(0.2)
 
                     status_txt.text("Sheet update ho raha hai...")
+                    _flush_awb_batches(force=True)
 
-                    # Batch update T/U/V/W for orders WITH tracking
-                    if sheet_updates:
-                        try:
-                            for su in sheet_updates:
-                                su["fill_source_q"] = False
-                            update_sheet_tracking(sheets_svc, SHEET_ID, sheet_updates)
-                            db.log_sync("SHEET_TRACKING", "SUCCESS", f"{len(sheet_updates)} rows updated")
-                        except Exception as e:
-                            st.error(f"Sheet T/U/V/W update failed: {e}")
-
-                    # Batch update R/S — FULFILLED when tracking found; R cleared when only planning/status in V
-                    all_qr = fulfilled_qr_updates + no_trk_remark_updates
-                    if all_qr:
-                        try:
-                            update_sheet_remarks(sheets_svc, SHEET_ID, all_qr)
-                            db.log_sync("SHEET_REMARKS", "SUCCESS", f"{len(all_qr)} rows → R/S updated")
-                        except Exception as e:
-                            st.error(f"Sheet R/S update failed: {e}")
+                    if sheet_updates or fulfilled_qr_updates or no_trk_remark_updates:
+                        db.log_sync(
+                            "SHEET_TRACKING",
+                            "SUCCESS",
+                            f"Fetch-all flush complete ({len(result_rows)} rows processed)",
+                        )
 
                     status_txt.text("✅ Done!")
                     prog.progress(1.0)
