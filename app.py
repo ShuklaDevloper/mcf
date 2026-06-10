@@ -1102,16 +1102,12 @@ def _shopify_fulfill(order_id, shopify_cfg, tracking_info=None):
         return False, str(e)[:80]
 
 
-def row_indicates_fulfilled_for_mcf_lookup(fulfilled_str: str) -> bool:
-    """Column S (fulfilled) must suggest fulfillment before we call MCF / Delhivery AWB APIs."""
-    s = (fulfilled_str or "").lower()
-    return "ful" in s or "plan" in s or "process" in s or "mcf" in s
-
-
-def row_indicates_fulfilled_for_mcf_lookup(fulfilled_str: str) -> bool:
-    """Column S (fulfilled) must suggest fulfillment before we call MCF / Delhivery AWB APIs."""
-    s = (fulfilled_str or "").lower()
-    return "ful" in s or "plan" in s or "process" in s or "mcf" in s
+def row_indicates_fulfilled_for_mcf_lookup(fulfilled_str: str, status_str: str = "") -> bool:
+    """Column R (fulfilled) or V (status) must suggest fulfillment before we call MCF / Delhivery AWB APIs."""
+    s1 = (fulfilled_str or "").lower()
+    s2 = (status_str or "").lower()
+    return ("ful" in s1 or "plan" in s1 or "process" in s1 or "mcf" in s1) or \
+           ("ful" in s2 or "plan" in s2 or "process" in s2 or "mcf" in s2)
 
 
 AWB_FETCH_BATCH_SIZE = 10
@@ -1150,7 +1146,7 @@ def _awb_fetch_process_one(order, secrets, token, shopify_cfg):
     order_id = order["order_id"]
     track_upd = qr_ok = qr_fail = None
 
-    if not row_indicates_fulfilled_for_mcf_lookup(order.get("fulfilled", "")):
+    if not row_indicates_fulfilled_for_mcf_lookup(order.get("fulfilled", ""), order.get("status", "")):
         return ({
             "Order ID": order_id,
             "Customer": order["customer"],
@@ -1524,6 +1520,7 @@ def _render_awb_fetch():
                             "carrier":      str(o.get("carrier", "")).strip(),
                             "source":       source,
                             "fulfilled":    str(o.get("fulfilled", "")).strip(),
+                            "status":       str(o.get("status", "")).strip(),
                         })
                 st.session_state.tracking_sheet_orders = mcf_orders
                 has_trk = sum(1 for o in mcf_orders if o["tracking_no"])
