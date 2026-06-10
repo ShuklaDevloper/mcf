@@ -1156,8 +1156,8 @@ def _awb_fetch_process_one(order, secrets, token, shopify_cfg):
     status_val = str(order.get("status", "")).lower()
     fulfilled_val = str(order.get("fulfilled", "")).lower()
 
-    # Cancelled orders — skip always
-    if "cancel" in status_val or "cancel" in fulfilled_val:
+    # Cancelled orders — skip always (check Q column / fulfilled field, partial "canc" match)
+    if "canc" in fulfilled_val:
         return ({
             "Order ID": order_id,
             "Customer": order["customer"],
@@ -1534,16 +1534,19 @@ def _render_awb_fetch():
                 mcf_orders = []
                 for o in data.get("orders", []):
                     source = str(o.get("source", "")).strip().upper()
-                    if "MCF" in source or "DELHI" in source:
+                    fulfilled = str(o.get("fulfilled", "")).strip()
+                    tracking_no = str(o.get("tracking_no", "")).strip()
+                    # Include if Q (fulfilled) has any value, NOT cancelled, AND T (tracking_no) is empty
+                    if fulfilled and "canc" not in fulfilled.lower() and not tracking_no:
                         mcf_orders.append({
                             "row_number":   int(o.get("row_number", 0) or 0),
                             "order_id":     str(o.get("ord_serial", "")).replace("#", "").strip(),
                             "customer":     o.get("customer", ""),
                             "amount":       o.get("amount", 0),
-                            "tracking_no":  str(o.get("tracking_no", "")).strip(),
+                            "tracking_no":  tracking_no,
                             "carrier":      str(o.get("carrier", "")).strip(),
                             "source":       source,
-                            "fulfilled":    str(o.get("fulfilled", "")).strip(),
+                            "fulfilled":    fulfilled,
                             "status":       str(o.get("status", "")).strip(),
                         })
                 st.session_state.tracking_sheet_orders = mcf_orders
