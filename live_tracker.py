@@ -427,8 +427,12 @@ def get_ithink_awb_by_order_no(
     )
 
 
-def lookup_awb_by_order_id(order_id, secrets=None, mcf_token=None):
-    """Find AWB by order ID: iThink → Delhivery → MCF (last).
+def lookup_awb_by_order_id(order_id, secrets=None, mcf_token=None, source=""):
+    """Find AWB by order ID.
+
+    Lookup order depends on source:
+    - MCF source: MCF first → if Unfulfillable, fall back to Delhivery → iThink
+    - Others: iThink → Delhivery → MCF
 
     Returns (awb, carrier, source_label, detail_status).
     """
@@ -439,26 +443,51 @@ def lookup_awb_by_order_id(order_id, secrets=None, mcf_token=None):
 
     ithink_token = secrets.get("Ithink_access_token", "")
     ithink_secret = secrets.get("Ithink_secret_key", "")
-    mcf_status = ""
+    del_keys = [k for k in [
+        secrets.get("DELHIVERY_API_KEY", ""),
+        secrets.get("DELHIVERY_API_KEY2", ""),
+    ] if k]
 
+    if mcf_token is None:
+        mcf_token, _ = get_access_token(secrets)
+
+    is_mcf = "MCF" in str(source).upper()
+
+    if is_mcf:
+        # MCF source: try MCF first (fast, direct)
+        mcf_status = ""
+        if mcf_token:
+            tn, cc, mcf_status, _raw = fetch_mcf_data(oid, mcf_token)
+            if tn:
+                return tn, cc or "Amazon", "MCF", mcf_status or "Found on MCF"
+
+        # MCF returned Unfulfillable (or no tracking) — try Delhivery then iThink
+        if del_keys:
+            d_found, d_awb, d_status, _err = get_delhivery_tracking(del_keys, oid)
+            if d_found and d_awb:
+                return d_awb, "Delhivery", "Delhivery", d_status or "Found on Delhivery"
+
+        awb, carrier = get_ithink_awb_by_order_no(
+            oid, ithink_token, ithink_secret, secrets=secrets
+        )
+        if awb:
+            return awb, carrier or "iThink Logistics", "iThink", "Found on iThink"
+
+        return "", "", "", mcf_status or "Not found"
+
+    # Non-MCF source: iThink → Delhivery → MCF
     awb, carrier = get_ithink_awb_by_order_no(
         oid, ithink_token, ithink_secret, secrets=secrets
     )
     if awb:
         return awb, carrier or "iThink Logistics", "iThink", "Found on iThink"
 
-    del_keys = [
-        secrets.get("DELHIVERY_API_KEY", ""),
-        secrets.get("DELHIVERY_API_KEY2", ""),
-    ]
-    del_keys = [k for k in del_keys if k]
     if del_keys:
         d_found, d_awb, d_status, _err = get_delhivery_tracking(del_keys, oid)
         if d_found and d_awb:
             return d_awb, "Delhivery", "Delhivery", d_status or "Found on Delhivery"
 
-    if mcf_token is None:
-        mcf_token, _ = get_access_token(secrets)
+    mcf_status = ""
     if mcf_token:
         tn, cc, mcf_status, _raw = fetch_mcf_data(oid, mcf_token)
         if tn:

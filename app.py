@@ -1114,7 +1114,7 @@ AWB_FETCH_BATCH_SIZE = 5
 AWB_LOOKUP_TIMEOUT_SEC = 12
 
 
-def _lookup_awb_with_timeout(order_id, secrets, mcf_token, timeout_sec=AWB_LOOKUP_TIMEOUT_SEC):
+def _lookup_awb_with_timeout(order_id, secrets, mcf_token, timeout_sec=AWB_LOOKUP_TIMEOUT_SEC, source=""):
     """Cap per-order lookup so Streamlit never hangs 90s+ on slow iThink scan."""
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
 
@@ -1126,6 +1126,7 @@ def _lookup_awb_with_timeout(order_id, secrets, mcf_token, timeout_sec=AWB_LOOKU
         order_id,
         secrets=secrets,
         mcf_token=mcf_token,
+        source=source,
     )
     try:
         result = fut.result(timeout=timeout_sec)
@@ -1168,7 +1169,8 @@ def _awb_fetch_process_one(order, secrets, token, shopify_cfg):
         }, None, None, None)
 
     tn, cc, src_label, detail_status = _lookup_awb_with_timeout(
-        order_id, secrets=secrets, mcf_token=token
+        order_id, secrets=secrets, mcf_token=token,
+        source=orig_source,
     )
 
     # Timeout — don't touch the sheet; leave order pending for next run
