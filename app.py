@@ -23,6 +23,7 @@ from utils import (
     fulfill_order,
     get_access_token,
     get_delhivery_tracking,
+    get_order_awb,
     get_shopify_config,
     get_shopify_order,
     infer_sheet_source_q,
@@ -1535,23 +1536,23 @@ def _render_awb_fetch():
                 for o in data.get("orders", []):
                     source = str(o.get("source", "")).strip().upper()
                     fulfilled = str(o.get("fulfilled", "")).strip()
-                    tracking_no = str(o.get("tracking_no", "")).strip()
-                    # Include if Q (fulfilled) has any value, NOT cancelled, AND T (tracking_no) is empty
-                    if fulfilled and "canc" not in fulfilled.lower() and not tracking_no:
+                    # Apps Script: AWB is in 'carrier' field, carrier name in 'tracking_no'
+                    existing_awb = get_order_awb(o)
+                    # Include if: Q (fulfilled) non-empty, NOT cancelled, T (AWB) is empty
+                    if fulfilled and "canc" not in fulfilled.lower() and not existing_awb:
                         mcf_orders.append({
                             "row_number":   int(o.get("row_number", 0) or 0),
                             "order_id":     str(o.get("ord_serial", "")).replace("#", "").strip(),
                             "customer":     o.get("customer", ""),
                             "amount":       o.get("amount", 0),
-                            "tracking_no":  tracking_no,
+                            "tracking_no":  existing_awb,
                             "carrier":      str(o.get("carrier", "")).strip(),
                             "source":       source,
                             "fulfilled":    fulfilled,
                             "status":       str(o.get("status", "")).strip(),
                         })
                 st.session_state.tracking_sheet_orders = mcf_orders
-                has_trk = sum(1 for o in mcf_orders if o["tracking_no"])
-                st.success(f"✅ {len(mcf_orders)} MCF orders found | With tracking: {has_trk} | Without: {len(mcf_orders)-has_trk}")
+                st.success(f"✅ {len(mcf_orders)} orders without tracking found")
             except Exception as e:
                 st.error(f"Endpoint error: {e}")
 
