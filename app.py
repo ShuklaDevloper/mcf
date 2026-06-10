@@ -1118,17 +1118,22 @@ def _lookup_awb_with_timeout(order_id, secrets, mcf_token, timeout_sec=AWB_LOOKU
     """Cap per-order lookup so Streamlit never hangs 90s+ on slow iThink scan."""
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
 
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        fut = ex.submit(
-            lookup_awb_by_order_id,
-            order_id,
-            secrets=secrets,
-            mcf_token=mcf_token,
-        )
-        try:
-            return fut.result(timeout=timeout_sec)
-        except FutTimeout:
-            return "", "", "", f"Timeout ({timeout_sec}s) — deploy latest live_tracker.py"
+    # Do NOT use 'with' — its __exit__ calls shutdown(wait=True) which blocks
+    # until the background thread finishes even after a timeout.
+    ex = ThreadPoolExecutor(max_workers=1)
+    fut = ex.submit(
+        lookup_awb_by_order_id,
+        order_id,
+        secrets=secrets,
+        mcf_token=mcf_token,
+    )
+    try:
+        result = fut.result(timeout=timeout_sec)
+        ex.shutdown(wait=False)
+        return result
+    except FutTimeout:
+        ex.shutdown(wait=False)
+        return "", "", "", f"Timeout ({timeout_sec}s)"
 
 
 def _awb_fetch_flush_buffers(sheets_svc, track_buf, qr_ok_buf, qr_fail_buf):
