@@ -1171,6 +1171,18 @@ def _awb_fetch_process_one(order, secrets, token, shopify_cfg):
         order_id, secrets=secrets, mcf_token=token
     )
 
+    # Timeout — don't touch the sheet; leave order pending for next run
+    if detail_status and detail_status.startswith("Timeout"):
+        return ({
+            "Order ID": order_id,
+            "Customer": order["customer"],
+            "Status": f"⏱ {detail_status} — skipped",
+            "Tracking ID": "—",
+            "Carrier": "—",
+            "Shopify": "—",
+            "Sheet": "— (unchanged)",
+        }, None, None, None)
+
     if tn:
         remark = f"Tracking Added {datetime.now().strftime('%d/%m %H:%M')}"
         if detail_status and detail_status not in (
