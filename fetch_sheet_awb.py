@@ -1,4 +1,3 @@
-"""Fetch AWB/tracking for sheet rows that don't have tracking yet (MCF + Delhivery)."""
 import time
 from datetime import datetime
 import pandas as pd
