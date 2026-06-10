@@ -1110,7 +1110,7 @@ def row_indicates_fulfilled_for_mcf_lookup(fulfilled_str: str, status_str: str =
            ("ful" in s2 or "plan" in s2 or "process" in s2 or "mcf" in s2)
 
 
-AWB_FETCH_BATCH_SIZE = 10
+AWB_FETCH_BATCH_SIZE = 5
 AWB_LOOKUP_TIMEOUT_SEC = 12
 
 
@@ -1147,6 +1147,20 @@ def _awb_fetch_process_one(order, secrets, token, shopify_cfg):
     track_upd = qr_ok = qr_fail = None
 
     orig_source = str(order.get("source", "")).upper()
+    status_val = str(order.get("status", "")).lower()
+    fulfilled_val = str(order.get("fulfilled", "")).lower()
+
+    # Cancelled orders — skip always
+    if "cancel" in status_val or "cancel" in fulfilled_val:
+        return ({
+            "Order ID": order_id,
+            "Customer": order["customer"],
+            "Status": "Skipped — Cancelled",
+            "Tracking ID": "—",
+            "Carrier": "—",
+            "Shopify": "—",
+            "Sheet": "— (unchanged)",
+        }, None, None, None)
 
     tn, cc, src_label, detail_status = _lookup_awb_with_timeout(
         order_id, secrets=secrets, mcf_token=token

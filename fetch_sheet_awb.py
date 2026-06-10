@@ -96,9 +96,18 @@ def fetch_all():
         order_id = order["order_id"]
         orig_source = str(order.get("source", "")).upper()
         print(f"[{i+1}/{total}] Checking {order_id}...", end=" ")
+        status_val = str(order.get("status", "")).lower()
+        fulfilled_val = str(order.get("fulfilled", "")).lower()
 
-
-
+        # Cancelled orders — skip always
+        if "cancel" in status_val or "cancel" in fulfilled_val:
+            print("skipped (cancelled)")
+            skipped_count += 1
+            result_rows.append({
+                "Order ID": order_id, "Customer": order["customer"], "Status": "Skipped — Cancelled",
+                "Tracking ID": "", "Carrier": "", "Shopify": "", "Sheet": "unchanged",
+            })
+            continue
         tn, cc, mcf_status = "", "", ""
         is_delhivery_first = "DELHI" in orig_source
 
