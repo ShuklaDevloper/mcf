@@ -1111,7 +1111,7 @@ def row_indicates_fulfilled_for_mcf_lookup(fulfilled_str: str, status_str: str =
 
 
 AWB_FETCH_BATCH_SIZE = 10
-AWB_LOOKUP_TIMEOUT_SEC = 22
+AWB_LOOKUP_TIMEOUT_SEC = 12
 
 
 def _lookup_awb_with_timeout(order_id, secrets, mcf_token, timeout_sec=AWB_LOOKUP_TIMEOUT_SEC):
@@ -1147,34 +1147,6 @@ def _awb_fetch_process_one(order, secrets, token, shopify_cfg):
     track_upd = qr_ok = qr_fail = None
 
     orig_source = str(order.get("source", "")).upper()
-    is_mcf = "MCF" in orig_source
-    status_val = str(order.get("status", "")).lower()
-    fulfilled_val = str(order.get("fulfilled", "")).lower()
-
-    # Cancelled orders — skip always
-    if "cancel" in status_val or "cancel" in fulfilled_val:
-        return ({
-            "Order ID": order_id,
-            "Customer": order["customer"],
-            "Status": "Skipped — Cancelled",
-            "Tracking ID": "—",
-            "Carrier": "—",
-            "Shopify": "—",
-            "Sheet": "— (unchanged)",
-        }, None, None, None)
-
-    # MCF orders: ALWAYS process (auto-fill FULFILLED later)
-    # Non-MCF orders: check fulfilled/status field
-    if not is_mcf and not row_indicates_fulfilled_for_mcf_lookup(order.get("fulfilled", ""), order.get("status", "")):
-        return ({
-            "Order ID": order_id,
-            "Customer": order["customer"],
-            "Status": "Skipped — column R has no 'ful'",
-            "Tracking ID": "—",
-            "Carrier": "—",
-            "Shopify": "—",
-            "Sheet": "— (unchanged)",
-        }, None, None, None)
 
     tn, cc, src_label, detail_status = _lookup_awb_with_timeout(
         order_id, secrets=secrets, mcf_token=token

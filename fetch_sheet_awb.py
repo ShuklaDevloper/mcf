@@ -97,30 +97,7 @@ def fetch_all():
         orig_source = str(order.get("source", "")).upper()
         print(f"[{i+1}/{total}] Checking {order_id}...", end=" ")
 
-        is_mcf = "MCF" in orig_source
-        status_val = str(order.get("status", "")).lower()
-        fulfilled_val = str(order.get("fulfilled", "")).lower()
 
-        # Cancelled orders — skip always
-        if "cancel" in status_val or "cancel" in fulfilled_val:
-            print("skipped (cancelled)")
-            skipped_count += 1
-            result_rows.append({
-                "Order ID": order_id, "Customer": order["customer"], "Status": "Skipped — Cancelled",
-                "Tracking ID": "", "Carrier": "", "Shopify": "", "Sheet": "unchanged",
-            })
-            continue
-
-        # MCF orders: ALWAYS process (auto-fill FULFILLED)
-        # Non-MCF: check fulfilled/status field
-        if not is_mcf and not row_indicates_fulfilled_for_mcf_lookup(order.get("fulfilled", ""), order.get("status", "")):
-            print("skipped (column R not ready)")
-            skipped_count += 1
-            result_rows.append({
-                "Order ID": order_id, "Customer": order["customer"], "Status": "Skipped",
-                "Tracking ID": "", "Carrier": "", "Shopify": "", "Sheet": "unchanged",
-            })
-            continue
 
         tn, cc, mcf_status = "", "", ""
         is_delhivery_first = "DELHI" in orig_source
