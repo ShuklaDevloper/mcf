@@ -1,6 +1,9 @@
+"""Fetch AWB/tracking for sheet rows that don't have tracking yet (MCF + Delhivery)."""
 import time
 from datetime import datetime
+
 import pandas as pd
+
 import db
 from utils import (
     SHEET_ID,
@@ -18,11 +21,15 @@ from utils import (
     build_tracking_url,
 )
 from w import fetch_mcf_data
+
+
 def row_indicates_fulfilled_for_mcf_lookup(fulfilled_str: str, status_str: str = "") -> bool:
     s1 = (fulfilled_str or "").lower()
     s2 = (status_str or "").lower()
     return ("ful" in s1 or "plan" in s1 or "process" in s1 or "mcf" in s1) or \
            ("ful" in s2 or "plan" in s2 or "process" in s2 or "mcf" in s2)
+
+
 def shopify_fulfill(order_id, shopify_cfg, tracking_info=None):
     if not shopify_cfg.get("shop_url"):
         return False, "Shopify not configured"
@@ -39,6 +46,8 @@ def shopify_fulfill(order_id, shopify_cfg, tracking_info=None):
         return True, "Already fulfilled (no change)"
     except Exception as e:
         return False, str(e)[:80]
+
+
 def load_pending_orders():
     mcf_orders = []
     for o in fetch_orders_from_apps_script():
@@ -51,14 +60,18 @@ def load_pending_orders():
                 "tracking_no": get_order_awb(o),
                 "source": source,
                 "fulfilled": str(o.get("fulfilled", "")).strip(),
+                "status": str(o.get("status", "")).strip(),
             })
     return [o for o in mcf_orders if not o["tracking_no"]]
+
+
 def fetch_all():
     secrets = read_secret()
     token, err = get_access_token(secrets)
     if not token:
         print(f"[ERROR] Amazon auth failed: {err}")
         return
+
     shopify_cfg = get_shopify_config(secrets)
     try:
         sheets_svc = init_sheets_service(secrets)
@@ -67,20 +80,40 @@ def fetch_all():
         print(f"[WARN] Sheet update disabled: {e}")
     del_keys = [secrets.get("DELHIVERY_API_KEY", ""), secrets.get("DELHIVERY_API_KEY2", "")]
     del_keys = [k for k in del_keys if k]
+
     need_trk = load_pending_orders()
     total = len(need_trk)
     print(f"[INFO] {total} orders pending tracking in sheet")
+
     sheet_updates = []
     no_trk_remark_updates = []
     fulfilled_qr_updates = []
     found_count = 0
     skipped_count = 0
     result_rows = []
+
     for i, order in enumerate(need_trk):
         order_id = order["order_id"]
         orig_source = str(order.get("source", "")).upper()
         print(f"[{i+1}/{total}] Checking {order_id}...", end=" ")
-        if not row_indicates_fulfilled_for_mcf_lookup(order.get("fulfilled", ""), order.get("status", "")):
+
+        is_mcf = "MCF" in orig_source
+        status_val = str(order.get("status", "")).lower()
+        fulfilled_val = str(order.get("fulfilled", "")).lower()
+
+        # Cancelled orders — skip always
+        if "cancel" in status_val or "cancel" in fulfilled_val:
+            print("skipped (cancelled)")
+            skipped_count += 1
+            result_rows.append({
+                "Order ID": order_id, "Customer": order["customer"], "Status": "Skipped — Cancelled",
+                "Tracking ID": "", "Carrier": "", "Shopify": "", "Sheet": "unchanged",
+            })
+            continue
+
+        # MCF orders: ALWAYS process (auto-fill FULFILLED)
+        # Non-MCF: check fulfilled/status field
+        if not is_mcf and not row_indicates_fulfilled_for_mcf_lookup(order.get("fulfilled", ""), order.get("status", "")):
             print("skipped (column R not ready)")
             skipped_count += 1
             result_rows.append({
@@ -88,10 +121,13 @@ def fetch_all():
                 "Tracking ID": "", "Carrier": "", "Shopify": "", "Sheet": "unchanged",
             })
             continue
+
         tn, cc, mcf_status = "", "", ""
         is_delhivery_first = "DELHI" in orig_source
+
         if not is_delhivery_first:
             tn, cc, mcf_status, _ = fetch_mcf_data(order_id, token)
+
         if tn:
             remark = f"Tracking Added {datetime.now().strftime('%d/%m %H:%M')}"
             db.update_order_tracking(order_id, cc or "", tn, "")
@@ -135,6 +171,7 @@ def fetch_all():
                     })
                     time.sleep(0.4)
                     continue
+
             if is_delhivery_first:
                 status_label = "Delhivery: Not Found"
             else:
@@ -142,6 +179,7 @@ def fetch_all():
                     "Planning": "MCF: Planning", "Received": "MCF: Received", "Processing": "MCF: Processing",
                     "Complete": "MCF: Complete", "Cancelled": "MCF: Cancelled", "NotFound": "MCF: Not Found",
                 }.get(mcf_status, f"MCF: {mcf_status}")
+
             sheet_updates.append({
                 "row": order["row_number"], "carrier": "", "tracking_no": "", "url": "", "remark": status_label,
             })
@@ -153,25 +191,33 @@ def fetch_all():
                 "Order ID": order_id, "Customer": order["customer"], "Status": status_label,
                 "Tracking ID": "", "Carrier": "", "Shopify": "", "Sheet": status_label,
             })
+
         time.sleep(0.4)
+
     if result_rows:
         out_file = "Sheet_AWB_Fetch_Results.xlsx"
         pd.DataFrame(result_rows).to_excel(out_file, index=False)
         print(f"\n[INFO] Saved results to {out_file}")
+
     if not sheets_svc:
         print(f"\n[DONE] Found tracking: {found_count} | Still pending: {total - found_count - skipped_count} | Skipped: {skipped_count}")
         print("[NOTE] Add hide.json or GOOGLE_CREDS_FILE=path in secret.txt for sheet updates.")
         return
+
     print("\n[INFO] Updating Google Sheet...")
     if sheet_updates:
         for su in sheet_updates:
             su["fill_source_q"] = False
         update_sheet_tracking(sheets_svc, SHEET_ID, sheet_updates)
         print(f"  -> Updated tracking columns for {len(sheet_updates)} rows")
+
     all_qr = fulfilled_qr_updates + no_trk_remark_updates
     if all_qr:
         update_sheet_remarks(sheets_svc, SHEET_ID, all_qr)
         print(f"  -> Updated remarks for {len(all_qr)} rows")
+
     print(f"\n[DONE] Found tracking: {found_count} | Still pending: {total - found_count - skipped_count} | Skipped: {skipped_count}")
+
+
 if __name__ == "__main__":
     fetch_all()
