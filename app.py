@@ -1146,7 +1146,26 @@ def _awb_fetch_process_one(order, secrets, token, shopify_cfg):
     order_id = order["order_id"]
     track_upd = qr_ok = qr_fail = None
 
-    if not row_indicates_fulfilled_for_mcf_lookup(order.get("fulfilled", ""), order.get("status", "")):
+    orig_source = str(order.get("source", "")).upper()
+    is_mcf = "MCF" in orig_source
+    status_val = str(order.get("status", "")).lower()
+    fulfilled_val = str(order.get("fulfilled", "")).lower()
+
+    # Cancelled orders — skip always
+    if "cancel" in status_val or "cancel" in fulfilled_val:
+        return ({
+            "Order ID": order_id,
+            "Customer": order["customer"],
+            "Status": "Skipped — Cancelled",
+            "Tracking ID": "—",
+            "Carrier": "—",
+            "Shopify": "—",
+            "Sheet": "— (unchanged)",
+        }, None, None, None)
+
+    # MCF orders: ALWAYS process (auto-fill FULFILLED later)
+    # Non-MCF orders: check fulfilled/status field
+    if not is_mcf and not row_indicates_fulfilled_for_mcf_lookup(order.get("fulfilled", ""), order.get("status", "")):
         return ({
             "Order ID": order_id,
             "Customer": order["customer"],
