@@ -188,7 +188,7 @@ def init_sheets_service(secrets=None):
     return build("sheets", "v4", credentials=creds)
 
 
-def fetch_orders_from_apps_script(timeout=30):
+def fetch_orders_from_apps_script(timeout=90):
     """Load all orders from the Apps Script endpoint (no Sheets API creds needed)."""
     resp = requests.get(APPS_SCRIPT_URL, timeout=timeout)
     resp.raise_for_status()

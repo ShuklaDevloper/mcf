@@ -125,7 +125,7 @@ with st.sidebar:
 def fetch_endpoint_orders():
     """Fetch all orders from Apps Script. Returns (pending_list, processed_list, error)."""
     try:
-        resp = requests.get(APPS_SCRIPT_URL, timeout=30)
+        resp = requests.get(APPS_SCRIPT_URL, timeout=90)
         data = resp.json()
     except Exception as e:
         return [], [], f"Endpoint error: {e}"
@@ -1515,7 +1515,7 @@ def _render_awb_fetch():
     if st.button("🔄 Load MCF Orders from Sheet", key="load_mcf_btn"):
         with st.spinner("Sheet se MCF orders fetch kar raha hoon..."):
             try:
-                resp = requests.get(APPS_SCRIPT_URL, timeout=30)
+                resp = requests.get(APPS_SCRIPT_URL, timeout=90)
                 data = resp.json()
                 mcf_orders = []
                 for o in data.get("orders", []):
@@ -1865,7 +1865,7 @@ def page_sync():
     if st.button("▶ Manual Sync Now", type="primary"):
         with st.spinner("Syncing from Apps Script endpoint..."):
             try:
-                resp = requests.get(APPS_SCRIPT_URL, timeout=30)
+                resp = requests.get(APPS_SCRIPT_URL, timeout=90)
                 data = resp.json()
 
                 if not data.get("success") or not data.get("orders"):
