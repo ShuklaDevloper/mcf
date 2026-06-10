@@ -1259,7 +1259,7 @@ def _awb_fetch_process_one(order, secrets, token, shopify_cfg):
     }, track_upd, qr_ok, qr_fail)
 
 
-def _awb_fetch_run_batch(secrets, progress_slot, status_slot):
+def _awb_fetch_run_batch(secrets, progress_slot, status_slot, log_slot=None):
     """Process next AWB_FETCH_BATCH_SIZE orders; auto-continue via session state."""
     queue = st.session_state.get("awb_fetch_queue") or []
     idx = int(st.session_state.get("awb_fetch_idx") or 0)
@@ -1283,6 +1283,7 @@ def _awb_fetch_run_batch(secrets, progress_slot, status_slot):
         return True
 
     results = st.session_state.setdefault("awb_fetch_results", [])
+    logs = st.session_state.setdefault("awb_fetch_logs", [])
     track_buf = []
     qr_ok_buf = []
     qr_fail_buf = []
@@ -1290,8 +1291,10 @@ def _awb_fetch_run_batch(secrets, progress_slot, status_slot):
     end = min(idx + AWB_FETCH_BATCH_SIZE, total)
     for i in range(idx, end):
         order = queue[i]
+        src = order.get("source", "")
+        lookup_order = "MCF → Delhivery → iThink" if "MCF" in src.upper() else "iThink → Delhivery → MCF"
         status_slot.text(
-            f"Order {order['order_id']} ({i + 1}/{total}) — iThink → Delhivery → MCF..."
+            f"⏳ Order {order['order_id']} ({i + 1}/{total}) [{src or '?'}] — {lookup_order}..."
         )
         progress_slot.progress((i + 1) / total)
         row, tr, qok, qfail = _awb_fetch_process_one(order, secrets, token, shopify_cfg)
@@ -1302,6 +1305,14 @@ def _awb_fetch_run_batch(secrets, progress_slot, status_slot):
             qr_ok_buf.append(qok)
         if qfail:
             qr_fail_buf.append(qfail)
+
+        # Live log line
+        trk = row.get("Tracking ID", "—")
+        status_icon = "✅" if trk not in ("—", "", None) else ("⏱" if "Timeout" in str(row.get("Status","")) else "❌")
+        log_line = f"{status_icon} [{i+1}/{total}] #{order['order_id']} ({src}) → {row.get('Status','?')} | AWB: {trk}"
+        logs.append(log_line)
+        if log_slot is not None:
+            log_slot.code("\n".join(logs[-30:]), language=None)
 
     try:
         _awb_fetch_flush_buffers(sheets_svc, track_buf, qr_ok_buf, qr_fail_buf)
@@ -1607,7 +1618,13 @@ def _render_awb_fetch():
                     / max(len(st.session_state.get("awb_fetch_queue") or []), 1)
                 )
                 status_run = st.empty()
-                done = _awb_fetch_run_batch(secrets, prog_run, status_run)
+                st.markdown("**📋 Live Log** (last 30 lines):")
+                log_run = st.empty()
+                # Show existing logs if resuming
+                existing_logs = st.session_state.get("awb_fetch_logs", [])
+                if existing_logs:
+                    log_run.code("\n".join(existing_logs[-30:]), language=None)
+                done = _awb_fetch_run_batch(secrets, prog_run, status_run, log_slot=log_run)
                 if done:
                     st.session_state.awb_fetch_running = False
                     results = st.session_state.get("awb_fetch_results") or []
@@ -1638,6 +1655,7 @@ def _render_awb_fetch():
                 st.session_state.awb_fetch_running = True
                 st.session_state.awb_fetch_idx = 0
                 st.session_state.awb_fetch_results = []
+                st.session_state.awb_fetch_logs = []
                 st.session_state.awb_fetch_queue = list(need_trk)
                 st.rerun()
 
@@ -1656,9 +1674,15 @@ def _render_awb_fetch():
                         token2, err2 = get_fresh_token()
                         if token2:
                             oid = manual_id.strip().replace("#", "")
-                            st.write("**Lookup:** iThink → Delhivery → MCF")
+                            # Detect source from loaded orders list
+                            all_orders = st.session_state.get("tracking_sheet_orders") or []
+                            o_meta_src = next((o for o in all_orders if o["order_id"] == oid), None)
+                            order_source = o_meta_src["source"] if o_meta_src else "MCF"
+                            is_mcf_src = "MCF" in order_source.upper()
+                            lookup_label = "MCF → Delhivery → iThink" if is_mcf_src else "iThink → Delhivery → MCF"
+                            st.write(f"**Lookup:** {lookup_label}")
                             tn, cc, src_label, detail = _lookup_awb_with_timeout(
-                                oid, secrets=secrets, mcf_token=token2
+                                oid, secrets=secrets, mcf_token=token2, source=order_source
                             )
                             st.write(f"**Result:** `{detail or 'Not found'}` | Source: **{src_label or '—'}**")
                             if tn:
