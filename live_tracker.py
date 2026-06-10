@@ -195,6 +195,12 @@ ITHINK_STORE_DETAILS_URL = (
 ITHINK_STORE_LIST_URL = (
     "https://my.ithinklogistics.com/api_v3/store/get-order-list.json"
 )
+ITHINK_ORDER_DETAILS_URL = (
+    "https://my.ithinklogistics.com/api_v3/order/get_details.json"
+)
+
+# Cached index for _ithink_scan_store_orders (order_number -> (awb, carrier))
+_store_scan_index_cache = {"key": None, "by_order_no": {}}
 
 
 def _ithink_platform_id(secrets=None):
@@ -263,6 +269,70 @@ def _shopify_order_id_by_name(order_no, shop_url, headers):
     return ""
 
 
+def _ithink_awb_from_detail(detail):
+    if not isinstance(detail, dict):
+        return None, ""
+    awb = str(detail.get("awb_no") or detail.get("awb_number") or "").strip()
+    if not awb or len(awb) < 6:
+        return None, ""
+    carrier = str(
+        detail.get("logistic") or detail.get("courier") or "iThink Logistics"
+    ).strip()
+    return awb, carrier
+
+
+def _ithink_enrich_carrier(awb, carrier, ithink_token, ithink_secret):
+    if not awb:
+        return None, ""
+    if not carrier or carrier.lower() == "ithink logistics":
+        shipment = get_ithink_shipment(awb, ithink_token, ithink_secret)
+        if shipment and shipment.get("logistic"):
+            carrier = str(shipment.get("logistic")).strip()
+    return awb, carrier or "iThink Logistics"
+
+
+def _ithink_order_get_details_by_no(
+    order_no, ithink_token, ithink_secret, days_back=90
+):
+    """Direct iThink order/get_details lookup by display order number (fast, 1 API call)."""
+    clean = str(order_no).replace("#", "").strip()
+    if not clean or not ithink_token or not ithink_secret:
+        return None, ""
+    end = datetime.now().date()
+    start = end - timedelta(days=days_back)
+    payload = {
+        "data": {
+            "awb_number_list": "",
+            "order_no": clean,
+            "start_date": start.strftime("%Y-%m-%d"),
+            "end_date": end.strftime("%Y-%m-%d"),
+            "access_token": ithink_token,
+            "secret_key": ithink_secret,
+        }
+    }
+    try:
+        r = requests.post(
+            ITHINK_ORDER_DETAILS_URL,
+            headers={"Content-Type": "application/json"},
+            json=payload,
+            timeout=25,
+        )
+        if r.status_code != 200:
+            return None, ""
+        j = r.json()
+        if str(j.get("status", "")).strip().lower() != "success":
+            return None, ""
+        data = j.get("data") or {}
+        items = data.values() if isinstance(data, dict) else data
+        for detail in items:
+            awb, carrier = _ithink_awb_from_detail(detail)
+            if awb:
+                return awb, carrier
+    except Exception:
+        pass
+    return None, ""
+
+
 def _ithink_store_details_by_ids(
     shopify_ids, ithink_token, ithink_secret, platform_id="2"
 ):
@@ -296,11 +366,8 @@ def _ithink_store_details_by_ids(
         for detail in data.values():
             if not isinstance(detail, dict):
                 continue
-            awb = str(detail.get("awb_no") or detail.get("awb_number") or "").strip()
-            if awb and len(awb) >= 6:
-                carrier = str(
-                    detail.get("logistic") or detail.get("courier") or "iThink Logistics"
-                ).strip()
+            awb, carrier = _ithink_awb_from_detail(detail)
+            if awb:
                 return awb, carrier
     except Exception:
         pass
@@ -308,7 +375,12 @@ def _ithink_store_details_by_ids(
 
 
 def _ithink_scan_store_orders(
-    order_no, ithink_token, ithink_secret, days_back=90, platform_id="2"
+    order_no,
+    ithink_token,
+    ithink_secret,
+    days_back=90,
+    platform_id="2",
+    verbose=False,
 ):
     """Fallback: scan iThink store order list and match order_number field."""
     clean = str(order_no).replace("#", "").strip()
@@ -316,6 +388,12 @@ def _ithink_scan_store_orders(
         return None, ""
     end = datetime.now().date()
     start = end - timedelta(days=days_back)
+    cache_key = (str(platform_id), start.isoformat(), end.isoformat())
+
+    if _store_scan_index_cache["key"] == cache_key:
+        hit = _store_scan_index_cache["by_order_no"].get(clean)
+        return hit if hit else (None, "")
+
     list_payload = {
         "data": {
             "platform_id": str(platform_id),
@@ -326,6 +404,8 @@ def _ithink_scan_store_orders(
         }
     }
     try:
+        if verbose:
+            print(f"deep scan ({days_back}d)...", end=" ", flush=True)
         r = requests.post(
             ITHINK_STORE_LIST_URL,
             headers={"Content-Type": "application/json"},
@@ -338,8 +418,15 @@ def _ithink_scan_store_orders(
         if str(j.get("status", "")).strip().lower() != "success":
             return None, ""
         ids = [str(x).strip() for x in (j.get("data") or []) if str(x).strip()]
+        if verbose:
+            print(f"{len(ids)} ids", end=" ", flush=True)
+
+        by_order_no = {}
         batch_size = 25
-        for i in range(0, len(ids), batch_size):
+        total_batches = max(1, (len(ids) + batch_size - 1) // batch_size)
+        for batch_idx, i in enumerate(range(0, len(ids), batch_size)):
+            if verbose and (batch_idx == 0 or batch_idx % 10 == 0 or batch_idx == total_batches - 1):
+                print(f"batch {batch_idx + 1}/{total_batches}", end=" ", flush=True)
             chunk = ids[i : i + batch_size]
             detail_payload = {
                 "data": {
@@ -369,7 +456,7 @@ def _ithink_scan_store_orders(
                     or detail.get("order_no")
                     or ""
                 ).replace("#", "").strip()
-                if on != clean:
+                if not on:
                     continue
                 awb = str(detail.get("awb_no") or detail.get("awb_number") or "").strip()
                 if awb and len(awb) >= 6:
@@ -378,19 +465,32 @@ def _ithink_scan_store_orders(
                         or detail.get("courier")
                         or "iThink Logistics"
                     ).strip()
-                    return awb, carrier
+                    by_order_no[on] = (awb, carrier)
+
+        _store_scan_index_cache["key"] = cache_key
+        _store_scan_index_cache["by_order_no"] = by_order_no
+        if verbose:
+            print("done.", flush=True)
+        hit = by_order_no.get(clean)
+        return hit if hit else (None, "")
     except Exception:
         pass
     return None, ""
 
 
 def get_ithink_awb_by_order_no(
-    order_id, ithink_token, ithink_secret, days_back=90, secrets=None
+    order_id,
+    ithink_token,
+    ithink_secret,
+    days_back=90,
+    secrets=None,
+    allow_store_scan=False,
+    store_scan_verbose=False,
 ):
     """Look up iThink AWB by Shopify display order number (e.g. 5908).
 
-    iThink store/get-order-details expects Shopify internal order IDs, not display
-    numbers. We resolve the ID via Shopify name search, then query iThink store API.
+    Fast path only (default): order/get_details → store/get-order-details → Shopify ID.
+    Slow 90-day store scan runs only when allow_store_scan=True (avoid in normal use).
     """
     if not ithink_token or not ithink_secret:
         return None, ""
@@ -406,6 +506,19 @@ def get_ithink_awb_by_order_no(
 
     platform_id = _ithink_platform_id(secrets)
 
+    awb, carrier = _ithink_order_get_details_by_no(
+        oid, ithink_token, ithink_secret, days_back=days_back
+    )
+    if awb:
+        return _ithink_enrich_carrier(awb, carrier, ithink_token, ithink_secret)
+
+    for label in (oid, f"#{oid}"):
+        awb, carrier = _ithink_store_details_by_ids(
+            [label], ithink_token, ithink_secret, platform_id
+        )
+        if awb:
+            return _ithink_enrich_carrier(awb, carrier, ithink_token, ithink_secret)
+
     for store in _shopify_stores_from_secrets(secrets):
         shopify_id = _shopify_order_id_by_name(
             oid, store["shop_url"], store["headers"]
@@ -416,15 +529,67 @@ def get_ithink_awb_by_order_no(
             [shopify_id], ithink_token, ithink_secret, platform_id
         )
         if awb:
-            if not carrier or carrier.lower() == "ithink logistics":
-                shipment = get_ithink_shipment(awb, ithink_token, ithink_secret)
-                if shipment and shipment.get("logistic"):
-                    carrier = str(shipment.get("logistic")).strip()
-            return awb, carrier or "iThink Logistics"
+            return _ithink_enrich_carrier(awb, carrier, ithink_token, ithink_secret)
 
-    return _ithink_scan_store_orders(
-        oid, ithink_token, ithink_secret, days_back=days_back, platform_id=platform_id
+    if allow_store_scan:
+        return _ithink_scan_store_orders(
+            oid,
+            ithink_token,
+            ithink_secret,
+            days_back=days_back,
+            platform_id=platform_id,
+            verbose=store_scan_verbose,
+        )
+    return None, ""
+
+
+def lookup_awb_mcf_first(order_id, secrets=None, mcf_token=None):
+    """Find AWB: MCF → Delhivery → iThink.
+
+    If MCF is Unfulfillable (no tracking), still checks Delhivery and iThink.
+    Returns (awb, carrier, source_label, detail_status).
+    detail_status is ``Unfulfillable`` only when MCF says so and nothing else found.
+    """
+    secrets = secrets or read_secret()
+    oid = str(order_id).replace("#", "").strip()
+    if not oid:
+        return "", "", "", ""
+
+    ithink_token = secrets.get("Ithink_access_token", "")
+    ithink_secret = secrets.get("Ithink_secret_key", "")
+    del_keys = [
+        k
+        for k in [
+            secrets.get("DELHIVERY_API_KEY", ""),
+            secrets.get("DELHIVERY_API_KEY2", ""),
+        ]
+        if k
+    ]
+
+    if mcf_token is None:
+        mcf_token, _ = get_access_token(secrets)
+
+    mcf_status = ""
+    if mcf_token:
+        tn, cc, mcf_status, _raw = fetch_mcf_data(oid, mcf_token)
+        if tn:
+            return tn, cc or "Amazon", "MCF", mcf_status or "Found on MCF"
+
+    if del_keys:
+        d_found, d_awb, d_status, _err = get_delhivery_tracking(del_keys, oid)
+        if d_found and d_awb:
+            return d_awb, "Delhivery", "Delhivery", d_status or "Found on Delhivery"
+
+    awb, carrier = get_ithink_awb_by_order_no(
+        oid, ithink_token, ithink_secret, secrets=secrets
     )
+    if awb:
+        return awb, carrier or "iThink Logistics", "iThink", "Found on iThink"
+
+    if mcf_status and "unfulfillable" in mcf_status.lower():
+        return "", "", "MCF", "Unfulfillable"
+
+    return "", "", "", mcf_status or "Not found"
 
 
 def lookup_awb_by_order_id(order_id, secrets=None, mcf_token=None, source=""):
@@ -454,26 +619,7 @@ def lookup_awb_by_order_id(order_id, secrets=None, mcf_token=None, source=""):
     is_mcf = "MCF" in str(source).upper()
 
     if is_mcf:
-        # MCF source: try MCF first (fast, direct)
-        mcf_status = ""
-        if mcf_token:
-            tn, cc, mcf_status, _raw = fetch_mcf_data(oid, mcf_token)
-            if tn:
-                return tn, cc or "Amazon", "MCF", mcf_status or "Found on MCF"
-
-        # MCF returned Unfulfillable (or no tracking) — try Delhivery then iThink
-        if del_keys:
-            d_found, d_awb, d_status, _err = get_delhivery_tracking(del_keys, oid)
-            if d_found and d_awb:
-                return d_awb, "Delhivery", "Delhivery", d_status or "Found on Delhivery"
-
-        awb, carrier = get_ithink_awb_by_order_no(
-            oid, ithink_token, ithink_secret, secrets=secrets
-        )
-        if awb:
-            return awb, carrier or "iThink Logistics", "iThink", "Found on iThink"
-
-        return "", "", "", mcf_status or "Not found"
+        return lookup_awb_mcf_first(order_id, secrets=secrets, mcf_token=mcf_token)
 
     # Non-MCF source: iThink → Delhivery → MCF
     awb, carrier = get_ithink_awb_by_order_no(
