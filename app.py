@@ -5,6 +5,8 @@ Multi-channel OMS: Amazon MCF + Delhivery + Shopify + Google Sheet sync
 Run: streamlit run app.py
 """
 import io
+import re
+import threading
 import time
 from datetime import datetime, timedelta
 
@@ -12,14 +14,22 @@ import pandas as pd
 import requests
 import streamlit as st
 
+# ── Background live-tracker job store ──────────────────────────────────────
+# Keyed by a per-session job_id stored in st.session_state.
+# Background threads write here; UI reads on every rerun.
+_live_jobs: dict = {}
+_live_jobs_lock = threading.Lock()
+
 import db
 from utils import (
     APPS_SCRIPT_URL,
     SHEET_ID,
+    batch_update_tracking_rows,
     build_tracking_url,
     clean_phone_number,
     create_delhivery_order,
     create_mcf_order,
+    format_sheet_cell_value,
     fulfill_order,
     get_access_token,
     get_delhivery_tracking,
@@ -35,7 +45,12 @@ from utils import (
     validate_address,
     validate_pincode,
 )
-from live_tracker import lookup_awb_by_order_id, run_live_tracking_update
+from live_tracker import (
+    lookup_awb_by_order_id,
+    looks_like_tracking_number,
+    run_live_tracking_update,
+    track_awb_live,
+)
 
 # ─────────────────────────────────────────────
 # MCF BLOCKED SKUs — these will NOT be sent to Amazon MCF
@@ -1466,73 +1481,480 @@ def _compute_planning_stale_rows(sheets_service, min_age_days: int = 2):
 # ─────────────────────────────────────────────
 # PAGE 3: TRACKING
 # ─────────────────────────────────────────────
+def _parse_paste_list(text):
+    """Split pasted order IDs / AWBs by comma, space, or newline."""
+    if not text or not str(text).strip():
+        return []
+    parts = re.split(r"[\s,\n]+", str(text).strip())
+    seen, out = set(), []
+    for p in parts:
+        p = p.strip().replace("#", "")
+        if p and p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def _load_sheet_order_row_map(service):
+    """Map order ID → sheet row number."""
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SHEET_ID,
+        range="Sheet1!A:L",
+        valueRenderOption="UNFORMATTED_VALUE",
+    ).execute()
+    rows = result.get("values", [])
+    if not rows:
+        return {}
+    headers = [str(h).strip().lower() for h in rows[0]]
+    oid_idx = -1
+    for col in ("ord_serial", "order id", "ord", "order"):
+        if col in headers:
+            oid_idx = headers.index(col)
+            break
+    if oid_idx == -1:
+        oid_idx = 11
+    row_map = {}
+    for i, row in enumerate(rows[1:], start=2):
+        if len(row) <= oid_idx:
+            continue
+        oid = format_sheet_cell_value(row[oid_idx]).replace("#", "").strip()
+        if oid:
+            row_map[oid] = i
+    return row_map
+
+
+def _load_sheet_tracking_row_map(service):
+    """Map tracking number (column T) → sheet row number."""
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SHEET_ID,
+        range="Sheet1!A:AF",
+        valueRenderOption="UNFORMATTED_VALUE",
+    ).execute()
+    rows = result.get("values", [])
+    if not rows:
+        return {}
+    headers = [str(h).strip().lower() for h in rows[0]]
+    trk_idx = -1
+    for col in ("tracking no", "tracking no.", "tracking number"):
+        if col in headers:
+            trk_idx = headers.index(col)
+            break
+    if trk_idx == -1:
+        trk_idx = 19
+    row_map = {}
+    for i, row in enumerate(rows[1:], start=2):
+        if len(row) <= trk_idx:
+            continue
+        tn = format_sheet_cell_value(row[trk_idx]).strip()
+        if tn and looks_like_tracking_number(tn):
+            row_map[tn] = i
+    return row_map
+
+
 def page_tracking():
     st.title("🚚 Tracking Hub")
     tab_awb, tab_live = st.tabs(["📦 AWB Fetch (MCF)", "🟢 Live Transit Updates"])
-    
+
     with tab_live:
         _render_live_updates()
-        
+
     with tab_awb:
-        _render_awb_fetch()
+        sec_bulk, sec_lookup, sec_manual = st.tabs([
+            "📋 Sheet Bulk Fetch",
+            "🔎 Order ID → Tracking ID",
+            "📍 Manual AWB Tracking",
+        ])
+        with sec_bulk:
+            _render_awb_fetch()
+        with sec_lookup:
+            _render_order_id_lookup()
+        with sec_manual:
+            _render_manual_awb_track()
+
+def _live_tracker_worker(job_id: str, batch_size: int):
+    """Background thread — runs independently of Streamlit reruns."""
+    job = _live_jobs[job_id]
+    start = 0
+    try:
+        while True:
+            if job.get("cancel"):
+                break
+
+            def on_result(row):
+                st_val = row.get("Status", "?")
+                rto = row.get("RTO", "")
+                scan = (row.get("Last Scan") or "")[:60]
+                line = (
+                    f"{row.get('Order ID','?')} | {row.get('Tracking ID','?')} | {st_val}"
+                    + (f" | RTO:{rto}" if rto else "")
+                    + (f" | {scan}" if scan else "")
+                )
+                with _live_jobs_lock:
+                    job["results"].append(row)
+                    job["logs"].append(line)
+
+            def on_progress(idx, total, no):
+                with _live_jobs_lock:
+                    job["progress"] = min(1.0, (idx + 1) / max(total, 1))
+                    job["status_text"] = f"Tracking: {no} ({idx+1}/{total})"
+
+            chunk = run_live_tracking_update(
+                progress_callback=on_progress,
+                result_callback=on_result,
+                start_index=start,
+                max_count=batch_size,
+            )
+
+            if chunk and str(chunk[0].get("Order ID", chunk[0].get("order_id", ""))).lower() == "error":
+                with _live_jobs_lock:
+                    job["error"] = chunk[0].get("Status", "Unknown error")
+                break
+
+            if not chunk or len(chunk) < batch_size:
+                break
+            start += len(chunk)
+            time.sleep(0.3)
+
+    except Exception as e:
+        with _live_jobs_lock:
+            job["error"] = str(e)
+    finally:
+        with _live_jobs_lock:
+            job["done"] = True
+            job["progress"] = 1.0
+
 
 def _render_live_updates():
     st.info(
         "ℹ️ **Live Tracker:** Sheet ke column T (AWB) se live status track karta hai — "
-        "Delhivery / iThink / Amazon. 1000+ rows ke liye andar se batch mein chalega "
-        "(timeout / sheet API limit se bachne ke liye)."
+        "Delhivery → MCF/Swiship → iThink. Tab switch karne par bhi nahi rukta."
     )
     batch_size = st.selectbox(
         "Rows per internal batch",
         options=[100, 150, 200, 250],
-        index=1,
+        index=3,
         help="Har batch ke baad sheet save hoti hai — beech mein ruke to bhi data safe.",
     )
 
-    if st.button("▶ Run Full Live Tracking Update", type="primary"):
-        prog = st.progress(0)
-        status_txt = st.empty()
-        all_res = []
-        start = 0
+    job_id = st.session_state.get("live_job_id")
+    job = _live_jobs.get(job_id) if job_id else None
 
-        with st.spinner("Fetching data and querying carrier APIs..."):
-            while True:
-                def make_cb(offset):
-                    def cb(idx, total, no):
-                        prog.progress(min(1.0, (idx + 1) / max(total, 1)))
-                        status_txt.text(f"Tracking: {no} ({idx + 1}/{total})")
-                    return cb
+    col1, col2 = st.columns([2, 3])
 
-                chunk = run_live_tracking_update(
-                    progress_callback=make_cb(start),
-                    start_index=start,
-                    max_count=batch_size,
-                )
+    if col1.button(
+        "▶ Run Full Live Tracking Update",
+        type="primary",
+        disabled=bool(job and not job.get("done")),
+    ):
+        new_id = f"live_{time.time()}"
+        _live_jobs[new_id] = {
+            "running": True, "done": False, "cancel": False,
+            "progress": 0.0, "status_text": "Starting...",
+            "results": [], "logs": [], "error": None,
+        }
+        st.session_state.live_job_id = new_id
+        t = threading.Thread(
+            target=_live_tracker_worker,
+            args=(new_id, batch_size),
+            daemon=True,
+        )
+        t.start()
+        st.rerun()
 
-                if chunk and str(chunk[0].get("Order ID", chunk[0].get("order_id", ""))).lower() == "error":
-                    st.error(chunk[0].get("Status", chunk[0].get("status", "Unknown error")))
-                    break
+    if job and not job.get("done") and col2.button("⏹ Stop", key="stop_live"):
+        job["cancel"] = True
 
-                if not chunk:
-                    break
+    if job:
+        with _live_jobs_lock:
+            prog_val   = job.get("progress", 0.0)
+            status_txt = job.get("status_text", "")
+            logs       = list(job.get("logs", []))
+            results    = list(job.get("results", []))
+            done       = job.get("done", False)
+            error      = job.get("error")
 
-                all_res.extend(chunk)
-                if len(chunk) < batch_size:
-                    break
-                start += len(chunk)
-                time.sleep(0.4)
-
-        status_txt.text(f"✅ Done — {len(all_res)} row(s) processed")
-        prog.progress(1.0)
-        if all_res:
-            st.dataframe(pd.DataFrame(all_res), width="stretch", hide_index=True)
+        st.progress(prog_val)
+        if error:
+            st.error(f"Error: {error}")
+        elif done:
+            st.success(f"✅ Done — {len(results)} row(s) processed")
         else:
-            st.warning("No tracking numbers found to update.")
+            st.text(status_txt)
+
+        if logs:
+            st.markdown("**📋 Live Log** (last 50 lines):")
+            st.code("\n".join(logs[-50:]), language=None)
+
+        if results:
+            st.dataframe(pd.DataFrame(results), width="stretch", hide_index=True)
+
+        if not done:
+            time.sleep(1)
+            st.rerun()
+    elif not job:
+        st.info("▶ Button dabao — tab switch karne par bhi tracking chalti rahegi.")
+
+def _render_order_id_lookup():
+    st.info(
+        "ℹ️ **Order ID → Tracking:** MCF → Delhivery → iThink. "
+        "MCF Unfulfillable ho tab bhi Delhivery/iThink try hota hai — "
+        "sirf teeno fail hone par sheet par `MCF: Unfulfillable`."
+    )
+    raw = st.text_area(
+        "Order IDs (comma, space, ya newline)",
+        height=120,
+        placeholder="5045\n5087\n5510",
+        key="oid_lookup_input",
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        u_shopify = st.checkbox("Shopify fulfill jab AWB mile", value=True, key="oid_u_shopify")
+    with c2:
+        u_sheet = st.checkbox("Google Sheet update", value=True, key="oid_u_sheet")
+
+    if st.button("▶ Find Tracking by Order ID", type="primary", key="oid_lookup_run"):
+        ids = _parse_paste_list(raw)
+        if not ids:
+            st.warning("Koi Order ID nahi.")
+            return
+
+        prog = st.progress(0)
+        stat = st.empty()
+        st.markdown("**📋 Live Log**")
+        log_box = st.empty()
+        res_box = st.empty()
+
+        token, err = get_fresh_token()
+        if err:
+            st.error(f"Auth: {err}")
+            return
+
+        shopify_cfg = get_shopify_config(secrets)
+        row_map = {}
+        sheets_svc = None
+        if u_sheet:
+            try:
+                sheets_svc = init_sheets_service()
+                row_map = _load_sheet_order_row_map(sheets_svc)
+            except Exception as e:
+                st.warning(f"Sheet map load fail: {e}")
+
+        results = []
+        logs = []
+        for i, oid in enumerate(ids):
+            stat.text(f"Order #{oid} ({i + 1}/{len(ids)}) — MCF → Delhivery → iThink...")
+            prog.progress((i + 1) / len(ids))
+
+            tn, cc, src_label, detail = _lookup_awb_with_timeout(
+                oid, secrets=secrets, mcf_token=token, source="MCF"
+            )
+
+            row = {
+                "Order ID": oid,
+                "Tracking ID": tn or "—",
+                "Carrier": cc or "—",
+                "Source": src_label or "—",
+                "Detail": detail or ("Found" if tn else "Not found"),
+                "Shopify": "—",
+                "Sheet": "—",
+            }
+
+            if tn and u_shopify:
+                s_ok, s_msg = _shopify_fulfill(
+                    oid,
+                    shopify_cfg,
+                    tracking_info={
+                        "number": tn,
+                        "company": cc or src_label,
+                        "url": build_tracking_url(cc or src_label, tn),
+                    },
+                )
+                row["Shopify"] = "✅ Fulfilled" if s_ok else f"⚠️ {s_msg}"
+
+            if u_sheet and sheets_svc:
+                rn = row_map.get(oid)
+                if rn:
+                    try:
+                        if tn:
+                            sheet_src = src_label or infer_sheet_source_q(cc, tn)
+                            update_sheet_remarks(sheets_svc, SHEET_ID, [{
+                                "row": rn,
+                                "source": sheet_src,
+                                "status": "FULFILLED",
+                            }])
+                            update_sheet_tracking(sheets_svc, SHEET_ID, [{
+                                "row": rn,
+                                "carrier": cc or src_label,
+                                "tracking_no": tn,
+                                "url": build_tracking_url(cc or src_label, tn),
+                                "remark": f"Tracking Added {datetime.now().strftime('%d/%m %H:%M')}",
+                                "fill_source_q": False,
+                            }])
+                            row["Sheet"] = "✅ AWB + Q/R/S/T/U"
+                        elif (detail or "").strip().lower() == "unfulfillable":
+                            update_sheet_tracking(sheets_svc, SHEET_ID, [{
+                                "row": rn,
+                                "carrier": "",
+                                "tracking_no": "",
+                                "url": "",
+                                "remark": "MCF: Unfulfillable",
+                            }])
+                            update_sheet_remarks(sheets_svc, SHEET_ID, [{
+                                "row": rn,
+                                "source": "MCF",
+                                "status": "FULFILLED",
+                            }])
+                            row["Sheet"] = "✅ MCF: Unfulfillable"
+                        else:
+                            row["Sheet"] = "— (no change)"
+                    except Exception as e:
+                        row["Sheet"] = f"⚠️ {str(e)[:40]}"
+                else:
+                    row["Sheet"] = "Not in sheet"
+
+            results.append(row)
+            logs.append(
+                f"#{oid} → {tn or detail or 'miss'} | {src_label or '—'} | Sheet: {row['Sheet']}"
+            )
+            log_box.code("\n".join(logs[-40:]), language=None)
+            res_box.dataframe(pd.DataFrame(results), width="stretch", hide_index=True)
+            time.sleep(0.35)
+
+        stat.text(f"✅ Done — {len(results)} order(s)")
+        found = sum(1 for r in results if r["Tracking ID"] != "—")
+        m1, m2 = st.columns(2)
+        m1.metric("AWB Found", found)
+        m2.metric("Not Found / Unfulfillable", len(results) - found)
+
+
+def _render_manual_awb_track():
+    st.info(
+        "ℹ️ **Manual AWB Track:** Delhivery (Key 1 + Key 2) → MCF/Swiship → iThink. "
+        "Status: Intransit / Delivered / RTO / Cancelled / Undelivered."
+    )
+    raw = st.text_area(
+        "Tracking numbers (AWB)",
+        height=120,
+        placeholder="52799210024743\n21025859414551",
+        key="manual_awb_input",
+    )
+    u_sheet = st.checkbox(
+        "Google Sheet update (Q–AB) agar AWB sheet mein mile",
+        value=True,
+        key="manual_u_sheet",
+    )
+
+    if st.button("▶ Track AWBs", type="primary", key="manual_awb_run"):
+        numbers = [
+            n for n in _parse_paste_list(raw)
+            if looks_like_tracking_number(n)
+        ]
+        if not numbers:
+            st.warning("Koi valid AWB nahi — kam se kam 8 digit tracking number chahiye.")
+            return
+
+        prog = st.progress(0)
+        stat = st.empty()
+        st.markdown("**📋 Live Log**")
+        log_box = st.empty()
+        res_box = st.empty()
+
+        row_map = {}
+        sheets_svc = None
+        if u_sheet:
+            try:
+                sheets_svc = init_sheets_service()
+                row_map = _load_sheet_tracking_row_map(sheets_svc)
+            except Exception as e:
+                st.warning(f"Sheet map load fail: {e}")
+
+        results = []
+        logs = []
+        sheet_batch = []
+
+        for i, awb in enumerate(numbers):
+            stat.text(f"Tracking {awb} ({i + 1}/{len(numbers)})...")
+            prog.progress((i + 1) / len(numbers))
+
+            track = track_awb_live(awb, secrets=secrets, fixed_order=True)
+            if track.get("found"):
+                status = track["status"]
+                if str(status).lower() == "rto":
+                    status = "RTO"
+                carrier = track.get("carrier", "")
+                last_up = track.get("last_update", "")
+                rto_val = track.get("rto", "")
+            else:
+                status = "Not Found"
+                carrier = last_up = rto_val = ""
+
+            row = {
+                "AWB": awb,
+                "Carrier": carrier or "—",
+                "Status": status,
+                "RTO (AB)": rto_val or "—",
+                "Last Scan": last_up or "—",
+                "ETA": track.get("eta", "") or "—",
+                "Sheet": "—",
+            }
+
+            rn = row_map.get(awb) if u_sheet else None
+            if rn and sheets_svc and track.get("found"):
+                if str(status).lower() == "cancelled":
+                    sheet_batch.append({
+                        "row": rn,
+                        "source": "Cancelled",
+                        "fulfilled": "Cancelled",
+                        "carrier": carrier,
+                        "tracking_no": awb,
+                        "url": track.get("url", ""),
+                        "status": "Cancelled",
+                        "last_status": last_up,
+                    })
+                    row["Sheet"] = f"✅ Row {rn} Cancelled"
+                else:
+                    sheet_batch.append({
+                        "row": rn,
+                        "source": infer_sheet_source_q(carrier, awb),
+                        "fulfilled": "FULFILLED",
+                        "carrier": carrier,
+                        "tracking_no": awb,
+                        "url": track.get("url", "") or build_tracking_url(carrier, awb),
+                        "status": status,
+                        "eta": track.get("eta", ""),
+                        "pickup": track.get("pickup", ""),
+                        "delivery": track.get("delivery", ""),
+                        "last_status": last_up,
+                        "rto": rto_val,
+                    })
+                    row["Sheet"] = f"✅ Row {rn} updated"
+            elif u_sheet:
+                row["Sheet"] = "Not in sheet"
+
+            results.append(row)
+            logs.append(
+                f"{awb} | {status}"
+                + (f" | RTO: {rto_val}" if rto_val else "")
+                + (f" | {last_up[:55]}" if last_up else "")
+            )
+            log_box.code("\n".join(logs[-40:]), language=None)
+            res_box.dataframe(pd.DataFrame(results), width="stretch", hide_index=True)
+            time.sleep(0.35)
+
+        if sheet_batch and sheets_svc:
+            try:
+                batch_update_tracking_rows(sheets_svc, SHEET_ID, sheet_batch)
+                st.success(f"Sheet updated — {len(sheet_batch)} row(s)")
+            except Exception as e:
+                st.error(f"Sheet batch update failed: {e}")
+
+        stat.text(f"✅ Done — {len(results)} AWB(s)")
+
 
 def _render_awb_fetch():
     st.info(
-        "ℹ️ **AWB lookup order:** iThink → Delhivery → MCF (last). "
-        "Jo ship ho chuke hain unka AWB milega + Shopify + Sheet update."
+        "ℹ️ **Sheet Bulk Fetch:** MCF orders jinke paas AWB nahi — "
+        "lookup: MCF → Delhivery → iThink. AWB mile to Shopify + Sheet update."
     )
 
     # ── Load MCF orders from Sheet endpoint (source of truth) ────────────
