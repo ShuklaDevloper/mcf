@@ -1,9 +1,15 @@
-"""Fulfilled Sheet Tracker — find AWB by order ID + live track eligible sheet rows.
+"""Final sheet automation — ek hi script, dono kaam automatic.
 
-Filters: R starts with fulf; skip V Delivered/RTO/Undelivered, Cancelled, AB Delivered, Unfulfillable.
-Track se RTO aaye to V=RTO + AB detail likho; V pehle se RTO ho to skip.
-Flow: T me valid AWB ho to sirf live track; T khali/placeholder ho to order ID se AWB dhundo.
-Writes Q–AB only when live track succeeds; track failed / no AWB → sheet unchanged.
+1) Column T khali / galat  → Order ID se AWB dhundo:
+      MCF → (Unfulfillable ho to bhi) Delhivery → iThink → Shopify
+      Sirf jab teeno fail + MCF Unfulfillable → sheet par MCF: Unfulfillable
+      AWB mile → Shopify update + sheet Q–T likho
+
+2) Column T mein valid AWB  → Live track (Delhivery → MCF → iThink)
+      Status RTO / Cancelled / Delivered / Intransit + ETA, RTO column update
+
+Run:  python fulfilled_sheet_tracker.py
+Dry:  python fulfilled_sheet_tracker.py --dry-run
 """
 import argparse
 import re
@@ -12,7 +18,7 @@ import time
 import pandas as pd
 
 from live_tracker import (
-    get_ithink_awb_by_order_no,
+    lookup_awb_mcf_first,
     looks_like_tracking_number,
     track_awb_live,
 )
@@ -23,14 +29,12 @@ from utils import (
     build_tracking_url,
     fulfill_order,
     get_access_token,
-    get_delhivery_tracking,
     get_shopify_config,
     get_shopify_order,
     infer_sheet_source_q,
     init_sheets_service,
     read_secret,
 )
-from w import fetch_mcf_data
 
 OUT_FILE = "Fulfilled_Sheet_Tracker_Results.xlsx"
 SHEET_RANGE = "Sheet1!A:AF"
@@ -106,54 +110,35 @@ def row_is_eligible(row, indices):
         return False, "V Undelivered"
     if "cancelled" in fulfilled.lower() or "cancelled" in status_v.lower():
         return False, "Cancelled"
+    if "unfulfillable" in status_v.lower():
+        return False, "Already Unfulfillable"
     if rto_ab.lower() == "delivered":
         return False, "RTO complete (AB Delivered)"
     return True, ""
 
 
 def find_awb_by_order_id(order_id, secrets, shopify_cfg, token):
-    """Phase 1: iThink → Delhivery → MCF → Shopify. Returns (awb, carrier, source) or empty."""
+    """MCF → Delhivery → iThink, then Shopify fulfillments fallback."""
     oid = str(order_id).replace("#", "").strip()
     if not oid:
-        return "", "", ""
+        return "", "", "", ""
 
-    ithink_token = secrets.get("Ithink_access_token", "")
-    ithink_secret = secrets.get("Ithink_secret_key", "")
-
-    # 1. iThink
-    awb, carrier = get_ithink_awb_by_order_no(
-        oid, ithink_token, ithink_secret, secrets=secrets
-    )
+    awb, carrier, source, detail = lookup_awb_mcf_first(oid, secrets=secrets, mcf_token=token)
     if awb:
-        return awb, carrier or "iThink Logistics", "iThink"
+        src = source or infer_sheet_source_q(carrier, awb)
+        return awb, carrier or src, src, ""
 
-    # 2. Delhivery
-    del_keys = [
-        secrets.get("DELHIVERY_API_KEY", ""),
-        secrets.get("DELHIVERY_API_KEY2", ""),
-    ]
-    del_keys = [k for k in del_keys if k]
-    if del_keys:
-        d_found, d_awb, _d_status, _err = get_delhivery_tracking(del_keys, oid)
-        if d_found and d_awb:
-            return d_awb, "Delhivery", "Delhivery"
+    if (detail or "").strip().lower() == "unfulfillable":
+        return "", "", "MCF", "Unfulfillable"
 
-    # 3. MCF
-    if token:
-        tn, cc, _mcf_status, _raw = fetch_mcf_data(oid, token)
-        if tn:
-            carrier = cc or "Amazon Transportation Services"
-            return tn, carrier, infer_sheet_source_q(carrier, tn)
-
-    # 4. Shopify fulfillments
     if shopify_cfg.get("shop_url"):
         info = fetch_shopify_order_details(oid, shopify_cfg)
         if info and info.get("tracking_no"):
             carrier = info.get("carrier") or "Shopify"
             tn = info["tracking_no"]
-            return tn, carrier, infer_sheet_source_q(carrier, tn)
+            return tn, carrier, infer_sheet_source_q(carrier, tn), ""
 
-    return "", "", ""
+    return "", "", "", detail or ""
 
 
 def resolve_awb(order_id, sheet_tracking, sheet_carrier, sheet_source, secrets, shopify_cfg, token):
@@ -166,11 +151,46 @@ def resolve_awb(order_id, sheet_tracking, sheet_carrier, sheet_source, secrets, 
         return sheet_t, sheet_carrier, src, "sheet_t"
 
     if oid:
-        awb, carrier, source = find_awb_by_order_id(oid, secrets, shopify_cfg, token)
+        awb, carrier, source, detail = find_awb_by_order_id(oid, secrets, shopify_cfg, token)
         if awb:
             return awb, carrier, source, "order_id"
+        if detail:
+            return "", "", "", f"miss:{detail}"
 
     return "", "", "", ""
+
+
+def _display_carrier(carrier, source_q, awb):
+    car = (carrier or "").strip()
+    if car.isdigit() and len(car) >= 10:
+        car = ""
+    if car and car.lower() not in ("fulfilled", "fulfill"):
+        return car
+    src = (source_q or "").strip().lower()
+    if src == "delhivery":
+        return "Delhivery"
+    if src == "ithink":
+        return "iThink Logistics"
+    if src == "mcf":
+        return "Amazon Transportation Services"
+    return infer_sheet_source_q(carrier, awb) or source_q or "Manual"
+
+
+def _append_sheet_row(sheet_updates, row_num, source_q, carrier, awb, url, status, track, fulfilled="FULFILLED"):
+    sheet_updates.append({
+        "row": row_num,
+        "source": source_q,
+        "fulfilled": fulfilled,
+        "carrier": _display_carrier(carrier, source_q, awb),
+        "tracking_no": awb,
+        "url": url or build_tracking_url(carrier, awb),
+        "status": status,
+        "eta": (track or {}).get("eta", ""),
+        "pickup": (track or {}).get("pickup", ""),
+        "delivery": (track or {}).get("delivery", ""),
+        "last_status": (track or {}).get("last_update", ""),
+        "rto": (track or {}).get("rto", ""),
+    })
 
 
 def push_tracking_to_shopify(order_id, tracking_no, carrier, shopify_cfg):
@@ -187,7 +207,7 @@ def push_tracking_to_shopify(order_id, tracking_no, carrier, shopify_cfg):
             shopify_cfg["shop_url"],
             tracking_info={
                 "number": tracking_no,
-                "company": carrier or "Other",
+                "company": _display_carrier(carrier, "", tracking_no),
                 "url": build_tracking_url(carrier, tracking_no),
             },
         )
@@ -277,23 +297,7 @@ def run(dry_run=False):
         row_num = item["row"]
         prefix = f"[{idx + 1}/{total}] Row {row_num} | #{order_id}"
 
-        # Shopify gate — Unfulfillable skip
-        if shopify_cfg.get("shop_url") and order_id:
-            shop_info = fetch_shopify_order_details(order_id, shopify_cfg)
-            if shop_info and shop_info.get("status", "").lower() == "unfulfillable":
-                print(f"{prefix} | SKIP Unfulfillable")
-                results.append({
-                    "Row": row_num,
-                    "Order ID": order_id,
-                    "Action": "skipped",
-                    "Reason": "Unfulfillable",
-                    "AWB": "",
-                    "Status": "",
-                    "RTO": "",
-                })
-                continue
-
-        # Phase 1 — sheet T if valid, else order ID search
+        # Phase 1 — sheet T if valid, else order ID search (MCF → Delhivery → iThink)
         effective_awb, carrier, source_q, awb_origin = resolve_awb(
             order_id,
             item["tracking_t"],
@@ -304,13 +308,27 @@ def run(dry_run=False):
             token,
         )
 
+        if awb_origin.startswith("miss:"):
+            miss = awb_origin.split(":", 1)[-1]
+            if miss.lower() == "unfulfillable":
+                print(f"{prefix} | MCF Unfulfillable (Delhivery/iThink bhi nahi) — sheet update")
+                _append_sheet_row(
+                    sheet_updates, row_num, "MCF", "", "", "", "MCF: Unfulfillable", {},
+                )
+                results.append({
+                    "Row": row_num, "Order ID": order_id, "Action": "unfulfillable",
+                    "Reason": "MCF: Unfulfillable", "AWB": "", "Status": "MCF: Unfulfillable", "RTO": "",
+                })
+                time.sleep(0.4)
+                continue
+
         if not effective_awb:
-            print(f"{prefix} | AWB not found (T empty + order ID miss) — sheet unchanged")
+            print(f"{prefix} | AWB not found — sheet unchanged")
             results.append({
                 "Row": row_num,
                 "Order ID": order_id,
                 "Action": "no_awb",
-                "Reason": "",
+                "Reason": awb_origin or "",
                 "AWB": "",
                 "Status": "",
                 "RTO": "",
@@ -334,18 +352,30 @@ def run(dry_run=False):
             source_hint=source_q,
             existing_rto=item["rto_ab"],
             existing_status=item["status_v"],
+            fixed_order=True,
         )
 
         if not track.get("found"):
             track_failed_count += 1
-            print(f"{prefix} | Track failed for {effective_awb} — sheet unchanged")
+            url = build_tracking_url(carrier, effective_awb)
+            print(f"{prefix} | Track API miss — AWB sheet par likh rahe hain: {effective_awb}")
+            _append_sheet_row(
+                sheet_updates,
+                row_num,
+                source_q,
+                carrier,
+                effective_awb,
+                url,
+                item["status_v"] or "Awaiting scan",
+                {},
+            )
             results.append({
                 "Row": row_num,
                 "Order ID": order_id,
-                "Action": "track_failed",
-                "Reason": "sheet unchanged",
+                "Action": "awb_only",
+                "Reason": "track_failed_awb_saved",
                 "AWB": effective_awb,
-                "Status": "",
+                "Status": item["status_v"] or "Awaiting scan",
                 "RTO": "",
             })
             time.sleep(0.4)
@@ -355,6 +385,26 @@ def run(dry_run=False):
         url = track.get("url") or build_tracking_url(carrier, effective_awb)
         status = track["status"]
         rto_val = track.get("rto", "")
+
+        if str(status).lower() == "cancelled":
+            print(f"{prefix} | Cancelled — Q/R/V updated")
+            sheet_updates.append({
+                "row": row_num,
+                "source": "Cancelled",
+                "fulfilled": "Cancelled",
+                "carrier": _display_carrier(track.get("carrier") or carrier, source_q, effective_awb),
+                "tracking_no": effective_awb,
+                "url": url,
+                "status": "Cancelled",
+                "last_status": track.get("last_update", ""),
+            })
+            results.append({
+                "Row": row_num, "Order ID": order_id, "Action": "cancelled",
+                "Reason": "Cancelled", "AWB": effective_awb, "Status": "Cancelled", "RTO": "",
+            })
+            time.sleep(0.4)
+            continue
+
         if str(status).lower() == "rto":
             status = "RTO"
             if not rto_val:
@@ -367,20 +417,16 @@ def run(dry_run=False):
             + f" | {track_note}"
         )
 
-        sheet_updates.append({
-            "row": row_num,
-            "source": source_q,
-            "fulfilled": "FULFILLED",
-            "carrier": track.get("carrier") or carrier,
-            "tracking_no": effective_awb,
-            "url": url,
-            "status": status,
-            "eta": track.get("eta", ""),
-            "pickup": track.get("pickup", ""),
-            "delivery": track.get("delivery", ""),
-            "last_status": track.get("last_update", ""),
-            "rto": rto_val,
-        })
+        _append_sheet_row(
+            sheet_updates,
+            row_num,
+            source_q,
+            track.get("carrier") or carrier,
+            effective_awb,
+            url,
+            status,
+            {**(track or {}), "rto": rto_val or track.get("rto", "")},
+        )
 
         results.append({
             "Row": row_num,
@@ -422,7 +468,7 @@ def run(dry_run=False):
     print(
         f"\n[DONE] Eligible: {total} | AWB via order ID: {found_awb_count} | "
         f"Tracked & sheet updated: {tracked_count} | "
-        f"Track failed (sheet unchanged): {track_failed_count}"
+        f"Track failed (AWB saved): {track_failed_count}"
     )
 
 

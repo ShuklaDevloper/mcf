@@ -53,13 +53,154 @@ def format_dt(value):
 
 def normalize_status(raw_state, raw_event=""):
     text = f"{raw_state} {raw_event}".strip().lower()
+    if "cancel" in text or "not pick" in text or "not pic" in text:
+        return "Cancelled"
     if "lost" in text or "damage" in text or "missing" in text:
         return "Lost"
-    if "rto" in text or "return" in text:
+    if "rto" in text or "return" in text or "returned" in text:
         return "RTO"
-    if "deliver" in text:
+    if "for return" in text or "out for return" in text or "expected return" in text:
+        return "RTO"
+    if "deliver" in text and "to origin" not in text:
         return "Delivered"
     return "Intransit"
+
+
+def _delhivery_is_rto(combined_upper, status_obj=None, shipment=None):
+    """True when Delhivery shipment is RTO / return in progress."""
+    markers = (
+        "RTO",
+        "RETURN",
+        "DTO",
+        "TO ORIGIN",
+        "OUT FOR RETURN",
+        "FOR RETURN",
+        "EXPECTED RETURN",
+        "REVERSE",
+        "RETURNING",
+    )
+    if any(m in combined_upper for m in markers):
+        return True
+    code = str((status_obj or {}).get("StatusCode", "") or "").strip().upper()
+    if code in {"RTO", "RT", "DTO", "RTD", "RTO-OT", "RTO-DL"}:
+        return True
+    if shipment:
+        for key in (
+            "ReturnPromisedDeliveryDate",
+            "ReturnedDate",
+            "RTOStartedDate",
+            "ReverseInTransit",
+        ):
+            if shipment.get(key):
+                return True
+    return False
+
+
+def _delhivery_all_status_text(shipment):
+    """Combine Delhivery Status header + every scan line (Returned often only appears in Scans)."""
+    parts = []
+    status_obj = shipment.get("Status", {}) or {}
+    parts.extend([
+        status_obj.get("Status", ""),
+        status_obj.get("Instructions", ""),
+        status_obj.get("StatusCode", ""),
+    ])
+    for scan in shipment.get("Scans") or []:
+        sd = scan.get("ScanDetail") or {}
+        if isinstance(sd, dict):
+            parts.extend([
+                sd.get("Scan", ""),
+                sd.get("Instructions", ""),
+                sd.get("StatusCode", ""),
+                sd.get("StatusDateTime", ""),
+            ])
+    for key in (
+        "ReturnPromisedDeliveryDate",
+        "ReturnedDate",
+        "RTOStartedDate",
+        "ReverseInTransit",
+    ):
+        val = shipment.get(key)
+        if val:
+            parts.append(str(val))
+    return " ".join(str(p) for p in parts if p)
+
+
+def _parse_delhivery_shipment(shipment):
+    """Parse Delhivery tracking JSON into status + dates. Scans checked for RTO/Returned."""
+    status_obj = shipment.get("Status", {}) or {}
+    raw_state = status_obj.get("Status", "")
+    raw_event = status_obj.get("Instructions", "")
+    raw_date = status_obj.get("StatusDateTime", "") or status_obj.get("StatusDate", "")
+    location = status_obj.get("StatusLocation", "")
+
+    combined = _delhivery_all_status_text(shipment).upper()
+
+    scans = shipment.get("Scans") or []
+    latest_sd = {}
+    if scans:
+        for candidate in (scans[-1], scans[0]):
+            latest_sd = candidate.get("ScanDetail") or {}
+            if latest_sd:
+                break
+
+    scan_label = latest_sd.get("Scan", "") or raw_state
+    scan_instr = latest_sd.get("Instructions", "") or raw_event
+    scan_loc = latest_sd.get("ScannedLocation", "") or latest_sd.get("StatusLocation", "") or location
+    last_update_value = f"{scan_label} | {scan_instr} | {scan_loc}".strip(" |")
+    latest_text = f"{scan_label} {scan_instr}".upper()
+
+    if (
+        "NOT PICKED" in combined
+        or "NOT PICKUP" in combined
+        or "NOT PIC" in combined
+        or "CANCEL" in combined
+    ):
+        status = "Cancelled"
+    elif _delhivery_is_rto(latest_text, status_obj, shipment) or _delhivery_is_rto(
+        combined, status_obj, shipment
+    ):
+        status = "RTO"
+    elif "DELIVERED" in combined:
+        status = "Delivered"
+    elif "UNDELIVERED" in combined or "FAILED" in combined or "NDR" in combined:
+        status = "Undelivered"
+    else:
+        status = "Intransit"
+
+    delivery_value = ""
+    if status == "Delivered":
+        delivery_value = format_dt(shipment.get("DeliveryDate", "") or raw_date)
+        if not delivery_value:
+            for scan in scans:
+                sd = scan.get("ScanDetail") or {}
+                if "DELIVERED" in (sd.get("Scan") or "").upper() and "RETURN" not in (sd.get("Scan") or "").upper():
+                    delivery_value = format_dt(sd.get("ScanDateTime", ""))
+                    break
+
+    rto_value = ""
+    if status == "RTO":
+        rto_value = last_update_value or "RTO Intransit"
+        for scan in scans:
+            sd = scan.get("ScanDetail") or {}
+            scan_text = f"{sd.get('Scan', '')} {sd.get('Instructions', '')}".upper()
+            if ("RTO" in scan_text or "RETURN" in scan_text) and "DELIVERED" in scan_text:
+                rto_value = "Delivered"
+                break
+            if "DTO" in scan_text or "TO ORIGIN" in scan_text:
+                rto_value = "Delivered"
+                break
+    else:
+        rto_value = ""
+
+    return {
+        "status": status,
+        "eta": format_dt(shipment.get("ExpectedDeliveryDate", "") or shipment.get("EDD", "")),
+        "pickup": format_dt(shipment.get("PickUpDate", "") or shipment.get("PickupDate", "")),
+        "delivery": delivery_value,
+        "last_update": last_update_value,
+        "rto": rto_value,
+    }
 
 
 def looks_like_tracking_number(value) -> bool:
@@ -727,8 +868,11 @@ def track_awb_live(
     source_hint="",
     existing_rto="",
     existing_status="",
+    fixed_order=False,
 ):
     """Live-track one AWB across Delhivery → iThink → Swiship → MCF.
+
+    When fixed_order=True, always tries Delhivery → MCF/Swiship → iThink (no carrier hint reorder).
 
     Returns dict with keys: found, status, carrier, eta, pickup, delivery,
     last_update, rto, url.
@@ -792,55 +936,25 @@ def track_awb_live(
                 if not shipment:
                     continue
 
-                status_obj = shipment.get("Status", {})
-                raw_state = status_obj.get("Status", "")
-                raw_event = status_obj.get("Instructions", "")
-                raw_date = status_obj.get("StatusDateTime", "") or status_obj.get("StatusDate", "")
-                location = status_obj.get("StatusLocation", "")
-                combined = f"{raw_state} {raw_event}".upper()
-
-                if "DELIVERED" in combined and "RTO" not in combined and "RETURN" not in combined:
-                    status = "Delivered"
-                elif "RTO" in combined or "RETURN" in combined:
-                    status = "RTO"
-                elif "UNDELIVERED" in combined or "FAILED" in combined or "NDR" in combined:
-                    status = "Undelivered"
-                else:
-                    status = "Intransit"
-
-                last_update_value = f"{raw_state} | {raw_event} | {location}".strip(" |")
-                delivery_value = ""
-                if status == "Delivered":
-                    delivery_value = format_dt(shipment.get("DeliveryDate", "") or raw_date)
-                    if not delivery_value:
-                        for scan in (shipment.get("Scans", []) or []):
-                            sd = scan.get("ScanDetail") or {}
-                            if "DELIVERED" in (sd.get("Scan") or "").upper():
-                                delivery_value = format_dt(sd.get("ScanDateTime", ""))
-
-                rto_value = ""
-                if status == "RTO":
-                    rto_value = last_update_value or "RTO Intransit"
-                    for scan in (shipment.get("Scans", []) or []):
-                        sd = scan.get("ScanDetail") or {}
-                        scan_text = f"{sd.get('Scan', '')} {sd.get('Instructions', '')}".upper()
-                        if ("RTO" in scan_text or "RETURN" in scan_text) and "DELIVERED" in scan_text:
-                            rto_value = "Delivered"
-                            break
-                else:
-                    rto_value = _apply_rto_return_logic(
-                        status, rto_value, existing_rto, existing_status, last_update_value
+                parsed = _parse_delhivery_shipment(shipment)
+                if parsed["status"] != "RTO" and parsed.get("rto") == "":
+                    parsed["rto"] = _apply_rto_return_logic(
+                        parsed["status"],
+                        "",
+                        existing_rto,
+                        existing_status,
+                        parsed["last_update"],
                     )
 
                 return {
                     "found": True,
-                    "status": status,
+                    "status": parsed["status"],
                     "carrier": "Delhivery",
-                    "eta": format_dt(shipment.get("ExpectedDeliveryDate", "") or shipment.get("EDD", "")),
-                    "pickup": format_dt(shipment.get("PickUpDate", "") or shipment.get("PickupDate", "")),
-                    "delivery": delivery_value,
-                    "last_update": last_update_value,
-                    "rto": rto_value,
+                    "eta": parsed["eta"],
+                    "pickup": parsed["pickup"],
+                    "delivery": parsed["delivery"],
+                    "last_update": parsed["last_update"],
+                    "rto": parsed["rto"],
                     "url": f"https://www.delhivery.com/track/package/{tracking_no}",
                 }
             except Exception:
@@ -879,6 +993,7 @@ def track_awb_live(
                 return None
             parsed = _parse_swiship_response(resp.json(), existing_rto, existing_status)
             parsed["found"] = True
+            parsed["carrier"] = parsed.get("carrier") or "MCF"
             parsed["url"] = f"https://www.swiship.co.uk/track?id={tracking_no}"
             return parsed
         except Exception:
@@ -906,7 +1021,9 @@ def track_awb_live(
         }
 
     order = []
-    if prefer_delhivery:
+    if fixed_order:
+        order = [try_delhivery, try_swiship, try_ithink]
+    elif prefer_delhivery:
         order = [try_delhivery, try_ithink, try_swiship, try_mcf]
     elif prefer_ithink:
         order = [try_ithink, try_delhivery, try_swiship, try_mcf]
@@ -918,7 +1035,7 @@ def track_awb_live(
     for fn in order:
         result = fn()
         if result and result.get("found"):
-            if result["status"] not in {"Delivered", "RTO", "Intransit", "Lost", "Undelivered"}:
+            if result["status"] not in {"Delivered", "RTO", "Intransit", "Lost", "Undelivered", "Cancelled"}:
                 result["status"] = "Intransit"
             return result
 
@@ -926,7 +1043,11 @@ def track_awb_live(
 
 
 def run_live_tracking_update(
-    progress_callback=None, start_index=0, max_count=None, service=None
+    progress_callback=None,
+    result_callback=None,
+    start_index=0,
+    max_count=None,
+    service=None,
 ):
     """Track all eligible sheet rows (column T AWB). Flushes in safe chunks for 1000+ rows.
 
@@ -973,6 +1094,7 @@ def run_live_tracking_update(
     delivery_idx = get_idx("delivery date", "deliverydate", "delevrey date")
     last_status_idx = get_idx("last status", "last update", "last_update")
     rto_idx = get_idx("rto")
+    fulfilled_idx = get_idx("fulfilled", "column r")
 
     if source_idx == -1 or tracking_no_idx == -1:
         return [{"order_id": "Error", "status": f"Could not find required columns (Source/Tracking). Headers: {headers}", "carrier": "", "desc": ""}]
@@ -982,6 +1104,8 @@ def run_live_tracking_update(
 
     col_tracking_url = (tracking_url_idx + 1) if tracking_url_idx != -1 else 20
     col_status = (status_idx + 1) if status_idx != -1 else 21
+    col_source = (source_idx + 1) if source_idx != -1 else 17
+    col_fulfilled = (fulfilled_idx + 1) if fulfilled_idx != -1 else 18
 
     orders_to_check = []
     for i in range(1, len(rows)):
@@ -1003,7 +1127,11 @@ def run_live_tracking_update(
             continue
         if existing_status.lower() == "delivered":
             continue
-        if existing_status.lower() == "rto" and existing_rto.lower() == "delivered":
+        if existing_status.lower() == "rto":
+            continue
+        if "cancelled" in existing_status.lower():
+            continue
+        if "unfulfillable" in existing_status.lower():
             continue
         if existing_rto.lower() == "delivered":
             continue
@@ -1057,6 +1185,7 @@ def run_live_tracking_update(
             source_hint=item.get("source", ""),
             existing_rto=item["existing_rto"],
             existing_status=item["existing_status"],
+            fixed_order=True,
         )
 
         if track.get("found"):
@@ -1077,10 +1206,24 @@ def run_live_tracking_update(
                 "range": f"{col_num_to_a1(col_tracking_url)}{row_num}",
                 "values": [[tracking_url]],
             })
-        pending_updates.append({
-            "range": f"{col_num_to_a1(col_status)}{row_num}",
-            "values": [[status]],
-        })
+        if str(status).lower() == "cancelled":
+            pending_updates.append({
+                "range": f"{col_num_to_a1(col_source)}{row_num}",
+                "values": [["Cancelled"]],
+            })
+            pending_updates.append({
+                "range": f"{col_num_to_a1(col_fulfilled)}{row_num}",
+                "values": [["Cancelled"]],
+            })
+            pending_updates.append({
+                "range": f"{col_num_to_a1(col_status)}{row_num}",
+                "values": [["Cancelled"]],
+            })
+        else:
+            pending_updates.append({
+                "range": f"{col_num_to_a1(col_status)}{row_num}",
+                "values": [[status]],
+            })
         if eta_idx != -1 and eta_value:
             pending_updates.append({
                 "range": f"{col_num_to_a1(eta_idx + 1)}{row_num}",
@@ -1107,15 +1250,21 @@ def run_live_tracking_update(
                 "values": [[rto_value]],
             })
 
-        summary_results.append({
+        row_summary = {
             "Order ID": order_id,
             "Tracking ID": tracking_no,
-            "Carrier": carrier,
+            "Carrier": track.get("carrier", carrier) if track.get("found") else carrier,
             "Status": status,
             "ETA": eta_value,
             "Last Scan": last_update_value,
             "RTO": rto_value,
-        })
+        }
+        summary_results.append(row_summary)
+        if result_callback:
+            try:
+                result_callback(row_summary)
+            except Exception:
+                pass
 
         print(
             f"  [{global_idx + 1}/{total_all}] Row {row_num} | T: {tracking_no} | "
