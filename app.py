@@ -1576,27 +1576,34 @@ def _live_tracker_worker(job_id: str, batch_size: int):
     job = _live_jobs[job_id]
     start = 0
     try:
+        import traceback
+
+        with _live_jobs_lock:
+            job["status_text"] = "📡 Sheet se data fetch ho raha hai... (30-60s)"
+
+        def on_result(row):
+            st_val = row.get("Status", "?")
+            rto = row.get("RTO", "")
+            scan = (row.get("Last Scan") or "")[:60]
+            line = (
+                f"{row.get('Order ID','?')} | {row.get('Tracking ID','?')} | {st_val}"
+                + (f" | RTO:{rto}" if rto else "")
+                + (f" | {scan}" if scan else "")
+            )
+            with _live_jobs_lock:
+                job["results"].append(row)
+                job["logs"].append(line)
+
+        def on_progress(idx, total, no):
+            with _live_jobs_lock:
+                job["progress"] = min(1.0, (idx + 1) / max(total, 1))
+                job["status_text"] = f"⏳ Tracking: {no} ({idx+1}/{total})"
+
         while True:
             if job.get("cancel"):
+                with _live_jobs_lock:
+                    job["logs"].append("⏹ Cancelled by user.")
                 break
-
-            def on_result(row):
-                st_val = row.get("Status", "?")
-                rto = row.get("RTO", "")
-                scan = (row.get("Last Scan") or "")[:60]
-                line = (
-                    f"{row.get('Order ID','?')} | {row.get('Tracking ID','?')} | {st_val}"
-                    + (f" | RTO:{rto}" if rto else "")
-                    + (f" | {scan}" if scan else "")
-                )
-                with _live_jobs_lock:
-                    job["results"].append(row)
-                    job["logs"].append(line)
-
-            def on_progress(idx, total, no):
-                with _live_jobs_lock:
-                    job["progress"] = min(1.0, (idx + 1) / max(total, 1))
-                    job["status_text"] = f"Tracking: {no} ({idx+1}/{total})"
 
             chunk = run_live_tracking_update(
                 progress_callback=on_progress,
@@ -1605,9 +1612,12 @@ def _live_tracker_worker(job_id: str, batch_size: int):
                 max_count=batch_size,
             )
 
+            # Error row returned
             if chunk and str(chunk[0].get("Order ID", chunk[0].get("order_id", ""))).lower() == "error":
+                err_msg = chunk[0].get("Status", chunk[0].get("status", "Unknown error"))
                 with _live_jobs_lock:
-                    job["error"] = chunk[0].get("Status", "Unknown error")
+                    job["error"] = err_msg
+                    job["logs"].append(f"❌ Error: {err_msg}")
                 break
 
             if not chunk or len(chunk) < batch_size:
@@ -1616,12 +1626,17 @@ def _live_tracker_worker(job_id: str, batch_size: int):
             time.sleep(0.3)
 
     except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
         with _live_jobs_lock:
-            job["error"] = str(e)
+            job["error"] = f"{e}\n{tb}"
+            job["logs"].append(f"❌ Exception: {e}")
     finally:
         with _live_jobs_lock:
             job["done"] = True
             job["progress"] = 1.0
+            if not job.get("error"):
+                job["status_text"] = f"✅ Done — {len(job['results'])} rows processed"
 
 
 def _render_live_updates():
@@ -1674,22 +1689,21 @@ def _render_live_updates():
             error      = job.get("error")
 
         st.progress(prog_val)
+        st.text(status_txt)
+
         if error:
-            st.error(f"Error: {error}")
-        elif done:
-            st.success(f"✅ Done — {len(results)} row(s) processed")
-        else:
-            st.text(status_txt)
+            st.error(f"❌ Error: {error}")
 
         if logs:
-            st.markdown("**📋 Live Log** (last 50 lines):")
+            st.markdown(f"**📋 Live Log** — {len(results)} processed so far:")
             st.code("\n".join(logs[-50:]), language=None)
 
-        if results:
+        if done and results:
+            st.success(f"✅ Done — {len(results)} row(s) processed")
             st.dataframe(pd.DataFrame(results), width="stretch", hide_index=True)
 
         if not done:
-            time.sleep(1)
+            time.sleep(1.5)
             st.rerun()
     elif not job:
         st.info("▶ Button dabao — tab switch karne par bhi tracking chalti rahegi.")
