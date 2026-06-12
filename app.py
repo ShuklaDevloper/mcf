@@ -6,19 +6,12 @@ Run: streamlit run app.py
 """
 import io
 import re
-import threading
 import time
 from datetime import datetime, timedelta
 
 import pandas as pd
 import requests
 import streamlit as st
-
-# ── Background live-tracker job store ──────────────────────────────────────
-# Keyed by a per-session job_id stored in st.session_state.
-# Background threads write here; UI reads on every rerun.
-_live_jobs: dict = {}
-_live_jobs_lock = threading.Lock()
 
 import db
 from utils import (
@@ -1128,6 +1121,7 @@ def row_indicates_fulfilled_for_mcf_lookup(fulfilled_str: str, status_str: str =
 
 AWB_FETCH_BATCH_SIZE = 5
 AWB_LOOKUP_TIMEOUT_SEC = 12
+LIVE_TRACK_RERUN_BATCH = 8  # rows per Streamlit rerun (Cloud timeout safe)
 
 
 def _lookup_awb_with_timeout(order_id, secrets, mcf_token, timeout_sec=AWB_LOOKUP_TIMEOUT_SEC, source=""):
@@ -1571,142 +1565,125 @@ def page_tracking():
         with sec_manual:
             _render_manual_awb_track()
 
-def _live_tracker_worker(job_id: str, batch_size: int):
-    """Background thread — runs independently of Streamlit reruns."""
-    job = _live_jobs[job_id]
-    start = 0
-    try:
-        import traceback
-
-        with _live_jobs_lock:
-            job["status_text"] = "📡 Sheet se data fetch ho raha hai... (30-60s)"
-
-        def on_result(row):
-            st_val = row.get("Status", "?")
-            rto = row.get("RTO", "")
-            scan = (row.get("Last Scan") or "")[:60]
-            line = (
-                f"{row.get('Order ID','?')} | {row.get('Tracking ID','?')} | {st_val}"
-                + (f" | RTO:{rto}" if rto else "")
-                + (f" | {scan}" if scan else "")
-            )
-            with _live_jobs_lock:
-                job["results"].append(row)
-                job["logs"].append(line)
-
-        def on_progress(idx, total, no):
-            with _live_jobs_lock:
-                job["progress"] = min(1.0, (idx + 1) / max(total, 1))
-                job["status_text"] = f"⏳ Tracking: {no} ({idx+1}/{total})"
-
-        while True:
-            if job.get("cancel"):
-                with _live_jobs_lock:
-                    job["logs"].append("⏹ Cancelled by user.")
-                break
-
-            chunk = run_live_tracking_update(
-                progress_callback=on_progress,
-                result_callback=on_result,
-                start_index=start,
-                max_count=batch_size,
-            )
-
-            # Error row returned
-            if chunk and str(chunk[0].get("Order ID", chunk[0].get("order_id", ""))).lower() == "error":
-                err_msg = chunk[0].get("Status", chunk[0].get("status", "Unknown error"))
-                with _live_jobs_lock:
-                    job["error"] = err_msg
-                    job["logs"].append(f"❌ Error: {err_msg}")
-                break
-
-            if not chunk or len(chunk) < batch_size:
-                break
-            start += len(chunk)
-            time.sleep(0.3)
-
-    except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        with _live_jobs_lock:
-            job["error"] = f"{e}\n{tb}"
-            job["logs"].append(f"❌ Exception: {e}")
-    finally:
-        with _live_jobs_lock:
-            job["done"] = True
-            job["progress"] = 1.0
-            if not job.get("error"):
-                job["status_text"] = f"✅ Done — {len(job['results'])} rows processed"
-
-
 def _render_live_updates():
     st.info(
         "ℹ️ **Live Tracker:** Sheet ke column T (AWB) se live status track karta hai — "
-        "Delhivery → MCF/Swiship → iThink. Tab switch karne par bhi nahi rukta."
+        "Delhivery (dono keys) → MCF/Swiship → iThink. "
+        "RTO / Cancelled / Delivered sahi detect."
     )
+    running = bool(st.session_state.get("live_track_running"))
     batch_size = st.selectbox(
-        "Rows per internal batch",
-        options=[100, 150, 200, 250],
-        index=3,
-        help="Har batch ke baad sheet save hoti hai — beech mein ruke to bhi data safe.",
+        "Rows per batch (har batch ke baad auto-save + refresh)",
+        options=[5, 8, 10, 15, 25],
+        index=1,
+        help="Chhota batch = Streamlit Cloud par zyada reliable. Har batch ke baad sheet save.",
+        key="live_track_batch_select",
+        disabled=running,
     )
+    per_run = min(int(batch_size), LIVE_TRACK_RERUN_BATCH)
 
-    job_id = st.session_state.get("live_job_id")
-    job = _live_jobs.get(job_id) if job_id else None
+    ss("live_track_running", False)
+    ss("live_track_start", 0)
+    ss("live_track_results", [])
+    ss("live_track_logs", [])
+    ss("live_track_error", None)
+    ss("live_track_progress", 0.0)
+    ss("live_track_status", "")
 
     col1, col2 = st.columns([2, 3])
 
     if col1.button(
         "▶ Run Full Live Tracking Update",
         type="primary",
-        disabled=bool(job and not job.get("done")),
+        disabled=running,
+        key="live_track_run_btn",
     ):
-        new_id = f"live_{time.time()}"
-        _live_jobs[new_id] = {
-            "running": True, "done": False, "cancel": False,
-            "progress": 0.0, "status_text": "Starting...",
-            "results": [], "logs": [], "error": None,
-        }
-        st.session_state.live_job_id = new_id
-        t = threading.Thread(
-            target=_live_tracker_worker,
-            args=(new_id, batch_size),
-            daemon=True,
-        )
-        t.start()
+        st.session_state.live_track_running = True
+        st.session_state.live_track_start = 0
+        st.session_state.live_track_results = []
+        st.session_state.live_track_logs = []
+        st.session_state.live_track_error = None
+        st.session_state.live_track_progress = 0.0
+        st.session_state.live_track_status = "Sheet load ho rahi hai..."
         st.rerun()
 
-    if job and not job.get("done") and col2.button("⏹ Stop", key="stop_live"):
-        job["cancel"] = True
+    if running and col2.button("⏹ Stop", key="stop_live_track"):
+        st.session_state.live_track_running = False
+        st.session_state.live_track_status = "⏹ Stopped by user"
+        st.rerun()
 
-    if job:
-        with _live_jobs_lock:
-            prog_val   = job.get("progress", 0.0)
-            status_txt = job.get("status_text", "")
-            logs       = list(job.get("logs", []))
-            results    = list(job.get("results", []))
-            done       = job.get("done", False)
-            error      = job.get("error")
+    prog = st.progress(st.session_state.live_track_progress)
+    status_txt = st.empty()
+    status_txt.text(st.session_state.live_track_status or "Ready")
 
-        st.progress(prog_val)
-        st.text(status_txt)
+    results = st.session_state.live_track_results or []
+    logs = st.session_state.live_track_logs or []
 
-        if error:
-            st.error(f"❌ Error: {error}")
+    if st.session_state.live_track_error:
+        st.error(f"❌ {st.session_state.live_track_error}")
 
-        if logs:
-            st.markdown(f"**📋 Live Log** — {len(results)} processed so far:")
-            st.code("\n".join(logs[-50:]), language=None)
+    if logs:
+        st.markdown(f"**📋 Live Log** — {len(results)} processed:")
+        st.code("\n".join(logs[-50:]), language=None)
 
-        if done and results:
-            st.success(f"✅ Done — {len(results)} row(s) processed")
-            st.dataframe(pd.DataFrame(results), width="stretch", hide_index=True)
+    if results:
+        st.dataframe(pd.DataFrame(results), width="stretch", hide_index=True)
 
-        if not done:
-            time.sleep(1.5)
+    if running:
+        start = int(st.session_state.live_track_start or 0)
+
+        def on_result(row):
+            st.session_state.live_track_results.append(row)
+            st_val = row.get("Status", "?")
+            rto = row.get("RTO", "")
+            scan = (row.get("Last Scan") or "")[:60]
+            st.session_state.live_track_logs.append(
+                f"{row.get('Order ID', '?')} | {row.get('Tracking ID', '?')} | {st_val}"
+                + (f" | RTO:{rto}" if rto else "")
+                + (f" | {scan}" if scan else "")
+            )
+
+        def on_progress(idx, total, no):
+            st.session_state.live_track_progress = min(1.0, (idx + 1) / max(total, 1))
+            st.session_state.live_track_status = f"⏳ Tracking: {no} ({idx + 1}/{total})"
+
+        try:
+            chunk = run_live_tracking_update(
+                progress_callback=on_progress,
+                result_callback=on_result,
+                start_index=start,
+                max_count=per_run,
+            )
+        except Exception as e:
+            st.session_state.live_track_error = str(e)
+            st.session_state.live_track_running = False
             st.rerun()
-    elif not job:
-        st.info("▶ Button dabao — tab switch karne par bhi tracking chalti rahegi.")
+
+        if chunk and str(chunk[0].get("Order ID", "")).lower() == "error":
+            st.session_state.live_track_error = chunk[0].get("Status", "Unknown error")
+            st.session_state.live_track_running = False
+        elif not chunk:
+            st.session_state.live_track_running = False
+            st.session_state.live_track_status = (
+                f"✅ Done — {len(st.session_state.live_track_results)} row(s)"
+                if st.session_state.live_track_results
+                else "⚠️ Koi eligible AWB nahi (T khali / already Delivered-RTO)"
+            )
+            st.session_state.live_track_progress = 1.0
+        elif len(chunk) < per_run:
+            st.session_state.live_track_running = False
+            st.session_state.live_track_status = (
+                f"✅ Done — {len(st.session_state.live_track_results)} row(s) processed"
+            )
+            st.session_state.live_track_progress = 1.0
+        else:
+            st.session_state.live_track_start = start + len(chunk)
+            prog.progress(st.session_state.live_track_progress)
+            status_txt.text(st.session_state.live_track_status)
+            time.sleep(0.4)
+            st.rerun()
+    elif not results:
+        st.caption("▶ Button dabao — har batch ke baad progress dikhega aur sheet update hogi.")
 
 def _render_order_id_lookup():
     st.info(
