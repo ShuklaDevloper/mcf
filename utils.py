@@ -132,7 +132,14 @@ def parse_date(date_str):
     """Convert various date formats to ISO 8601 UTC string."""
     if not date_str:
         return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    for fmt in ["%Y-%m-%d %H:%M:%S %z", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d"]:
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S %z",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%d",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+    ]:
         try:
             return datetime.strptime(date_str.strip(), fmt).strftime("%Y-%m-%dT%H:%M:%SZ")
         except ValueError:
@@ -593,13 +600,85 @@ def fulfill_order(order, headers, shop_url, tracking_info=None):
 # ─────────────────────────────────────────────
 # AMAZON MCF
 # ─────────────────────────────────────────────
-def create_mcf_order(token, order_data):
-    """Submit a fulfillment order to Amazon MCF (SP-API).
-    Returns (success: bool, message: str)
-    """
-    headers = {"x-amz-access-token": token, "Content-Type": "application/json"}
-    is_cod = "cod" in str(order_data.get("is_cod", "")).lower()
+def round_mcf_amount(value) -> str:
+    """Amazon India MCF expects whole INR amounts (no decimals)."""
+    try:
+        return str(int(round(float(value or 0))))
+    except (TypeError, ValueError):
+        return "0"
 
+
+def round_mcf_items(items):
+    """Ensure perUnitDeclaredValue uses whole INR."""
+    out = []
+    for item in items or []:
+        it = dict(item)
+        puv = it.get("perUnitDeclaredValue") or {}
+        if isinstance(puv, dict):
+            it["perUnitDeclaredValue"] = {
+                "currencyCode": puv.get("currencyCode", "INR"),
+                "value": round_mcf_amount(puv.get("value", 0)),
+            }
+        out.append(it)
+    return out
+
+
+def resolve_mcf_payment_mode(order_data, secrets=None):
+    """Amazon India MCF paymentMode — must match Seller Central allowed values."""
+    if secrets is None:
+        secrets = read_secret()
+    default = str(secrets.get("MCF_PAYMENT_MODE", "UPI")).strip() or "UPI"
+    raw = str(order_data.get("payment_mode", "") or order_data.get("paymentMode", "") or "").strip()
+    if not raw or raw.lower() in ("prepaid", "pre-paid", "pre paid", "online"):
+        return default
+    return raw
+
+
+def build_mcf_prepaid_payment_info(order_data, secrets=None):
+    """Amazon India MCF prepaid invoice fields (required for non-COD orders)."""
+    order_id = str(order_data.get("order_id", "")).replace("#", "").strip()
+    txn_id = str(order_data.get("payment_transaction_id", "") or order_id).strip()
+    return {
+        "paymentTransactionId": txn_id,
+        "paymentMode": resolve_mcf_payment_mode(order_data, secrets),
+        "paymentDate": parse_date(order_data.get("date", "")),
+    }
+
+
+def normalize_mcf_payment_information_list(order_data, secrets=None):
+    """Return valid paymentInformation array for prepaid MCF, or [] for COD."""
+    if "cod" in str(order_data.get("is_cod", "")).lower():
+        return []
+
+    existing = order_data.get("paymentInformationList") or order_data.get("paymentInformation") or []
+    if existing and isinstance(existing, list):
+        first = existing[0] if existing else {}
+        if isinstance(first, dict):
+            if first.get("paymentMethod") or first.get("paymentAmount") or first.get("PaymentMethod"):
+                return [build_mcf_prepaid_payment_info(order_data, secrets)]
+            if first.get("paymentTransactionId") and first.get("paymentMode"):
+                out = []
+                for item in existing:
+                    if not isinstance(item, dict):
+                        continue
+                    out.append({
+                        "paymentTransactionId": str(
+                            item.get("paymentTransactionId", order_data.get("order_id", ""))
+                        ).strip(),
+                        "paymentMode": resolve_mcf_payment_mode({**order_data, **item}, secrets),
+                        "paymentDate": item.get("paymentDate") or parse_date(order_data.get("date", "")),
+                    })
+                if out:
+                    return out
+
+    return [build_mcf_prepaid_payment_info(order_data, secrets)]
+
+
+def build_mcf_fulfillment_payload(order_data, secrets=None):
+    """Build Amazon MCF createFulfillmentOrder JSON body."""
+    if secrets is None:
+        secrets = read_secret()
+    is_cod = "cod" in str(order_data.get("is_cod", "")).lower()
     payload = {
         "marketplaceId": MARKETPLACE_ID,
         "sellerFulfillmentOrderId": order_data["order_id"],
@@ -620,21 +699,25 @@ def create_mcf_order(token, order_data):
         },
         "fulfillmentAction": "Ship",
         "fulfillmentPolicy": "FillOrKill",
-        "items": order_data.get("items", []),
+        "items": round_mcf_items(order_data.get("items", [])),
     }
-
-    # India MCF API requires codSettings for ALL orders.
-    # For COD: isCodRequired=True with order amount
-    # For Prepaid: isCodRequired=False with zero charge
-    # All item values must be in perUnitDeclaredValue in items array.
     if is_cod:
         payload["codSettings"] = {
             "isCodRequired": True,
-            "codCharge": {"currencyCode": "INR", "value": str(order_data.get("amount", "0"))},
+            "codCharge": {"currencyCode": "INR", "value": round_mcf_amount(order_data.get("amount", "0"))},
         }
-    pi = order_data.get("paymentInformationList")
-    if pi:  # list non-empty
-        payload["paymentInformationList"] = pi
+    else:
+        payload["codSettings"] = {"isCodRequired": False}
+        payload["paymentInformation"] = normalize_mcf_payment_information_list(order_data, secrets)
+    return payload
+
+
+def create_mcf_order(token, order_data):
+    """Submit a fulfillment order to Amazon MCF (SP-API).
+    Returns (success: bool, message: str)
+    """
+    headers = {"x-amz-access-token": token, "Content-Type": "application/json"}
+    payload = build_mcf_fulfillment_payload(order_data, read_secret())
 
     import json
     with open("payload_debug.json", "w") as f:
