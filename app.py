@@ -31,8 +31,10 @@ from utils import (
     get_shopify_order,
     infer_sheet_source_q,
     init_sheets_service,
+    normalize_mcf_payment_information_list,
     parse_date,
     read_secret,
+    round_mcf_amount,
     update_sheet_remarks,
     update_sheet_tracking,
     validate_address,
@@ -220,13 +222,11 @@ def fetch_endpoint_orders():
             "tracking_no": o.get("tracking_no", ""),
             "carrier": o.get("carrier", ""),
             "status": o.get("status", ""),
-            "paymentInformationList": [] if is_cod_flag else [{
-                "paymentMethod": "Prepaid",
-                "paymentAmount": {
-                    "currencyCode": "INR",
-                    "value": str(round(float(o.get("amount", 0) or 0), 2))
-                }
-            }]
+            "paymentInformation": [] if is_cod_flag else normalize_mcf_payment_information_list({
+                "order_id": order_id,
+                "date": o.get("date", ""),
+                "is_cod": o.get("is_cod", ""),
+            })
         }
 
         is_err = "error" in str(fulfilled).lower() or "fail" in str(fulfilled).lower() or "error" in str(o.get("status", "")).lower()
@@ -912,26 +912,25 @@ def _process_orders(full_df, selected, mcf_sel, del_sel):
                     qtys.append(1)
 
                 items = []
-                # Distribute amount across total units correctly so perUnitDeclaredValue is accurate
                 total_units = sum(qtys)
-                amount_per_item = float(row["amount"]) / max(1, total_units)
-                
+                amount_per_item = int(round(float(row["amount"]))) / max(1, total_units)
+                amount_per_item = int(round(amount_per_item))
+
                 for idx, sku in enumerate(skus):
                     if not sku: continue
                     items.append({
                         "sellerSku": sku,
                         "sellerFulfillmentOrderItemId": f"{sku}-{order_id}-{idx}",
                         "quantity": qtys[idx],
-                        "perUnitDeclaredValue": {"currencyCode": "INR", "value": str(round(amount_per_item, 2))},
+                        "perUnitDeclaredValue": {"currencyCode": "INR", "value": round_mcf_amount(amount_per_item)},
                     })
-                
+
                 if not items:
-                    # Fallback single item
                     items = [{
                         "sellerSku": "Unknown",
                         "sellerFulfillmentOrderItemId": f"Unknown-{order_id}-0",
                         "quantity": 1,
-                        "perUnitDeclaredValue": {"currencyCode": "INR", "value": str(row["amount"])},
+                        "perUnitDeclaredValue": {"currencyCode": "INR", "value": round_mcf_amount(row["amount"])},
                     }]
 
                 order_data = dict(row) | {"items": items}
@@ -2367,13 +2366,11 @@ def page_sync():
                         }
                         
                         is_cod_flag_sync = str(o.get("is_cod", "")).lower() in ["true", "yes", "1", "cod"]
-                        order_data["paymentInformationList"] = [] if is_cod_flag_sync else [{
-                            "paymentMethod": "Prepaid",
-                            "paymentAmount": {
-                                "currencyCode": "INR",
-                                "value": str(round(float(o.get("amount", 0) or 0), 2))
-                            }
-                        }]
+                        order_data["paymentInformation"] = [] if is_cod_flag_sync else normalize_mcf_payment_information_list({
+                            "order_id": str(o.get("ord_serial", "")).replace("#", "").strip(),
+                            "date": o.get("date", ""),
+                            "is_cod": o.get("is_cod", ""),
+                        })
                         if db.save_order(order_data):
                             added += 1
 
