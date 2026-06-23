@@ -2,7 +2,6 @@
 import time
 
 import pandas as pd
-import requests
 
 from live_tracker import lookup_awb_mcf_first, track_awb_live
 from utils import (
@@ -11,6 +10,7 @@ from utils import (
     fulfill_order,
     format_sheet_cell_value,
     get_shopify_config,
+    get_shopify_fulfillment_tracking,
     get_shopify_order,
     infer_sheet_source_q,
     init_sheets_service,
@@ -51,30 +51,15 @@ def _load_order_row_map(service):
 
 
 def _find_on_shopify_fulfillments(order_id, shopify_cfg):
-    shop_url = shopify_cfg.get("shop_url", "")
-    headers = shopify_cfg.get("headers", {})
-    if not shop_url:
+    hit = get_shopify_fulfillment_tracking(order_id, shopify_cfg=shopify_cfg)
+    if not hit:
         return None
-
-    s_order = get_shopify_order(order_id, headers, shop_url)
-    if not s_order:
-        return None
-
-    try:
-        f_url = f"{shop_url}/admin/api/2024-01/orders/{s_order['id']}/fulfillments.json"
-        fr = requests.get(f_url, headers=headers, timeout=20)
-        fr.raise_for_status()
-        for f in fr.json().get("fulfillments", []):
-            if f.get("status") in ("success", "pending") and f.get("tracking_number"):
-                return {
-                    "tracking_no": f.get("tracking_number", ""),
-                    "carrier": f.get("tracking_company") or "Shopify",
-                    "source": "Shopify",
-                    "status": "Intransit",
-                }
-    except Exception:
-        pass
-    return None
+    return {
+        "tracking_no": hit["tracking_no"],
+        "carrier": hit["carrier"] or "Shopify",
+        "source": hit.get("source", "Shopify"),
+        "status": "Intransit",
+    }
 
 
 def _sheet_carrier(carrier, source):
@@ -171,7 +156,7 @@ def find_tracking_for_orders(order_ids):
         shopify_msg = ""
         sheet_msg = ""
 
-        print("  -> MCF → Delhivery → iThink...")
+        print("  -> MCF → Delhivery → iThink → Shopify...")
         awb, car, src, detail_status = lookup_awb_mcf_first(oid_clean, secrets=secrets)
 
         if awb:
@@ -295,7 +280,7 @@ def find_tracking_for_orders(order_ids):
 if __name__ == "__main__":
     print(
         "Paste Order IDs (space or newline). Type DONE when finished.\n"
-        "Lookup: MCF → Delhivery → iThink | Updates Shopify + Sheet Q–V\n"
+        "Lookup: MCF → Delhivery → iThink → Shopify | Updates Shopify + Sheet Q–V\n"
     )
     target_ids = []
     while True:

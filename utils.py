@@ -530,6 +530,40 @@ def get_shopify_order(order_number, headers, shop_url):
     return None
 
 
+def get_shopify_fulfillment_tracking(order_id, shopify_cfg=None, secrets=None):
+    """Return tracking already on Shopify fulfillments, if any."""
+    if shopify_cfg is None:
+        secrets = secrets or read_secret()
+        shopify_cfg = get_shopify_config(secrets)
+
+    shop_url = shopify_cfg.get("shop_url", "")
+    headers = shopify_cfg.get("headers", {})
+    if not shop_url:
+        return None
+
+    s_order = get_shopify_order(order_id, headers, shop_url)
+    if not s_order:
+        return None
+
+    try:
+        f_url = f"{shop_url}/admin/api/2024-01/orders/{s_order['id']}/fulfillments.json"
+        fr = requests.get(f_url, headers=headers, timeout=20)
+        fr.raise_for_status()
+        for f in reversed(fr.json().get("fulfillments", [])):
+            if f.get("status") not in ("success", "pending", "open"):
+                continue
+            tn = (f.get("tracking_number") or "").strip()
+            if tn:
+                return {
+                    "tracking_no": tn,
+                    "carrier": (f.get("tracking_company") or "").strip(),
+                    "source": "Shopify",
+                }
+    except Exception:
+        pass
+    return None
+
+
 def fulfill_order(order, headers, shop_url, tracking_info=None):
     """Mark a Shopify order as fulfilled, with optional tracking info.
     - If open fulfillment_order exists → create fulfillment WITH tracking.
@@ -828,8 +862,34 @@ def get_delhivery_tracking(api_key, order_id):
 # ─────────────────────────────────────────────
 # DELHIVERY ORDER CREATION
 # ─────────────────────────────────────────────
-def create_delhivery_order(api_key, order_data, pickup_location="emaar"):
+def get_delhivery_api_keys(secrets=None):
+    """Both keys for tracking/lookup — KEY1 first, then KEY2."""
+    if secrets is None:
+        secrets = read_secret()
+    k1 = str(secrets.get("DELHIVERY_API_KEY", "")).strip()
+    k2 = str(secrets.get("DELHIVERY_API_KEY2", "")).strip()
+    return [k for k in (k1, k2) if k]
+
+
+def get_delhivery_order_api_keys(secrets=None):
+    """Order create only — DELHIVERY_API_KEY2 (Wondercare account)."""
+    if secrets is None:
+        secrets = read_secret()
+    k2 = str(secrets.get("DELHIVERY_API_KEY2", "")).strip()
+    return [k2] if k2 else []
+
+
+def delhivery_order_ref(order_id: str) -> str:
+    """Delhivery API order ref — append _N so re-ship avoids duplicate ref / skip."""
+    clean = str(order_id or "").replace("#", "").strip()
+    if clean.endswith("_N"):
+        return clean
+    return f"{clean}_N"
+
+
+def create_delhivery_order(api_key, order_data, pickup_location="emaar", shipping_mode="Express"):
     """Submit a shipment to Delhivery.
+    shipping_mode: 'Express' (Air) or 'Surface'
     Returns (success: bool, response_data: dict, error_msg: str)
     """
     keys = api_key if isinstance(api_key, list) else [api_key]
@@ -843,12 +903,13 @@ def create_delhivery_order(api_key, order_data, pickup_location="emaar"):
         "state": order_data.get("state_code", ""),
         "country": "India",
         "phone": order_data.get("phone", ""),
-        "order": order_data.get("order_id", ""),
+        "order": delhivery_order_ref(order_data.get("order_id", "")),
         "payment_mode": "COD" if is_cod else "Prepaid",
         "cod_amount": str(order_data.get("amount", "0")) if is_cod else "0",
         "products_desc": order_data.get("title", "Product")[:100],
         "total_amount": str(order_data.get("amount", "0")),
         "quantity": order_data.get("total_qty", 1),
+        "shipping_mode": shipping_mode,
         "waybill": "",
         "shipment_width": "",
         "shipment_height": "",
@@ -865,10 +926,12 @@ def create_delhivery_order(api_key, order_data, pickup_location="emaar"):
     for key in keys:
         if not key: continue
         try:
+            import urllib.parse
+            form_body = "format=json&data=" + urllib.parse.quote(json.dumps(payload))
             r = requests.post(
                 "https://track.delhivery.com/api/cmu/create.json",
-                headers={"Authorization": f"Token {key}", "Content-Type": "application/json"},
-                data={"data": json.dumps(payload)},
+                headers={"Authorization": f"Token {key}", "Content-Type": "application/x-www-form-urlencoded"},
+                data=form_body,
                 timeout=30,
             )
             resp = r.json() if r.status_code in [200, 201] else {}
@@ -876,8 +939,10 @@ def create_delhivery_order(api_key, order_data, pickup_location="emaar"):
                 pkgs = resp.get("packages", [])
                 if pkgs and pkgs[0].get("waybill"):
                     return True, resp, ""
-                remarks = pkgs[0].get("remarks", ["Unknown"]) if pkgs else ["Unknown"]
-                last_err = str(remarks)
+                remarks = pkgs[0].get("remarks", []) if pkgs else []
+                remark_str = ", ".join(str(x) for x in remarks) if remarks else ""
+                status_val = pkgs[0].get("status", "") if pkgs else ""
+                last_err = remark_str or status_val or f"No waybill. Full: {json.dumps(resp)[:300]}"
                 last_resp = resp
             else:
                 last_err = f"HTTP {r.status_code}: {r.text[:200]}"

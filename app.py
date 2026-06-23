@@ -25,6 +25,7 @@ from utils import (
     format_sheet_cell_value,
     fulfill_order,
     get_access_token,
+    get_delhivery_order_api_keys,
     get_delhivery_tracking,
     get_order_awb,
     get_shopify_config,
@@ -964,14 +965,10 @@ def _process_orders(full_df, selected, mcf_sel, del_sel):
 
     # ── DELHIVERY ────────────────────────────────────────────────────────
     if len(del_sel) > 0:
-        del_keys = [
-            secrets.get("DELHIVERY_API_KEY", ""),
-            secrets.get("DELHIVERY_API_KEY2", "")
-        ]
-        del_keys = [k for k in del_keys if k]
-        
+        del_keys = get_delhivery_order_api_keys(secrets)
+
         if not del_keys:
-            st.error("DELHIVERY_API_KEY missing in secret.txt or secrets")
+            st.error("DELHIVERY_API_KEY2 missing in secret.txt (required for order create)")
         else:
             for _, row in del_sel.iterrows():
                 order_id = row["order_id"]
@@ -1244,18 +1241,46 @@ def _awb_fetch_process_one(order, secrets, token, shopify_cfg):
             "Unfulfillable": "MCF: Unfulfillable",
         }.get(detail_status, f"MCF: {detail_status}" if detail_status else "Not Found")
 
-    track_upd = {
-        "row": order["row_number"],
-        "carrier": "",
-        "tracking_no": "",
-        "url": "",
-        "remark": status_label,
-    }
-    qr_fail = {
-        "row": order["row_number"],
-        "source": "Delhivery" if "DELHI" in orig_source else "MCF",
-        "status": "FULFILLED",
-    }
+    # Only write definitive MCF/Delhivery states — never stamp "Not Found" on the sheet.
+    if (detail_status or "").strip().lower() == "unfulfillable":
+        track_upd = {
+            "row": order["row_number"],
+            "carrier": "",
+            "tracking_no": "",
+            "url": "",
+            "remark": "MCF: Unfulfillable",
+        }
+        qr_fail = {
+            "row": order["row_number"],
+            "source": "MCF",
+            "status": "FULFILLED",
+        }
+        sheet_note = "✅ V: MCF: Unfulfillable"
+    elif detail_status in ("Planning", "Received", "Processing", "Complete", "Cancelled"):
+        track_upd = {
+            "row": order["row_number"],
+            "carrier": "",
+            "tracking_no": "",
+            "url": "",
+            "remark": status_label,
+        }
+        qr_fail = {
+            "row": order["row_number"],
+            "source": "Delhivery" if "DELHI" in orig_source else "MCF",
+            "status": "FULFILLED",
+        }
+        sheet_note = f"✅ V: {status_label}"
+    else:
+        return ({
+            "Order ID": order_id,
+            "Customer": order["customer"],
+            "Status": detail_status or status_label,
+            "Tracking ID": "—",
+            "Carrier": "—",
+            "Shopify": "—",
+            "Sheet": "— (unchanged — no AWB yet)",
+        }, None, None, None)
+
     return ({
         "Order ID": order_id,
         "Customer": order["customer"],
@@ -1263,8 +1288,8 @@ def _awb_fetch_process_one(order, secrets, token, shopify_cfg):
         "Tracking ID": "—",
         "Carrier": "—",
         "Shopify": "—",
-        "Sheet": f"✅ V: {status_label}",
-    }, track_upd, qr_ok, qr_fail)
+        "Sheet": sheet_note,
+    }, track_upd, None, qr_fail)
 
 
 def _awb_fetch_run_batch(secrets, progress_slot, status_slot, log_slot=None):
@@ -1686,9 +1711,10 @@ def _render_live_updates():
 
 def _render_order_id_lookup():
     st.info(
-        "ℹ️ **Order ID → Tracking:** MCF → Delhivery → iThink. "
-        "MCF Unfulfillable ho tab bhi Delhivery/iThink try hota hai — "
-        "sirf teeno fail hone par sheet par `MCF: Unfulfillable`."
+        "ℹ️ **Order ID → Tracking:** MCF → Delhivery → iThink → Shopify. "
+        "MCF Unfulfillable ho tab bhi Delhivery/iThink/Shopify try hota hai — "
+        "sirf teeno fail hone par sheet par `MCF: Unfulfillable`; "
+        "AWB na mile to sheet blank rehti hai (Not Found nahi likhte)."
     )
     raw = st.text_area(
         "Order IDs (comma, space, ya newline)",
@@ -1944,7 +1970,8 @@ def _render_manual_awb_track():
 def _render_awb_fetch():
     st.info(
         "ℹ️ **Sheet Bulk Fetch:** MCF orders jinke paas AWB nahi — "
-        "lookup: MCF → Delhivery → iThink. AWB mile to Shopify + Sheet update."
+        "lookup: MCF → Delhivery → iThink → Shopify. AWB mile to Shopify + Sheet update. "
+        "AWB na mile to sheet blank rehti hai (`MCF: Not Found` nahi likhte)."
     )
 
     # ── Load MCF orders from Sheet endpoint (source of truth) ────────────

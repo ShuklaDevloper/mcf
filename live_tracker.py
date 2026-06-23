@@ -9,6 +9,8 @@ from utils import (
     format_sheet_cell_value,
     get_access_token,
     get_delhivery_tracking,
+    get_shopify_fulfillment_tracking,
+    infer_sheet_source_q,
     init_sheets_service,
     read_secret,
     SHEET_ID,
@@ -727,6 +729,13 @@ def lookup_awb_mcf_first(order_id, secrets=None, mcf_token=None):
     if awb:
         return awb, carrier or "iThink Logistics", "iThink", "Found on iThink"
 
+    shop_hit = get_shopify_fulfillment_tracking(oid, secrets=secrets)
+    if shop_hit:
+        tn = shop_hit["tracking_no"]
+        cc = shop_hit["carrier"]
+        src = infer_sheet_source_q(cc, tn) or "Shopify"
+        return tn, cc or src, src, "Found on Shopify"
+
     if mcf_status and "unfulfillable" in mcf_status.lower():
         return "", "", "MCF", "Unfulfillable"
 
@@ -779,6 +788,13 @@ def lookup_awb_by_order_id(order_id, secrets=None, mcf_token=None, source=""):
         tn, cc, mcf_status, _raw = fetch_mcf_data(oid, mcf_token)
         if tn:
             return tn, cc or "Amazon", "MCF", mcf_status or "Found on MCF"
+
+    shop_hit = get_shopify_fulfillment_tracking(oid, secrets=secrets)
+    if shop_hit:
+        tn = shop_hit["tracking_no"]
+        cc = shop_hit["carrier"]
+        src = infer_sheet_source_q(cc, tn) or "Shopify"
+        return tn, cc or src, src, "Found on Shopify"
 
     return "", "", "", mcf_status or "Not found"
 

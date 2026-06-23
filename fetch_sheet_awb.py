@@ -11,6 +11,7 @@ from utils import (
     get_access_token,
     get_delhivery_tracking,
     get_shopify_config,
+    get_shopify_fulfillment_tracking,
     fulfill_order,
     get_shopify_order,
     get_order_awb,
@@ -19,8 +20,9 @@ from utils import (
     update_sheet_remarks,
     update_sheet_tracking,
     build_tracking_url,
+    infer_sheet_source_q,
 )
-from w import fetch_mcf_data
+from live_tracker import lookup_awb_mcf_first
 
 
 def row_indicates_fulfilled_for_mcf_lookup(fulfilled_str: str, status_str: str = "") -> bool:
@@ -109,10 +111,15 @@ def fetch_all():
             })
             continue
         tn, cc, mcf_status = "", "", ""
+        detail = ""
         is_delhivery_first = "DELHI" in orig_source
 
         if not is_delhivery_first:
-            tn, cc, mcf_status, _ = fetch_mcf_data(order_id, token)
+            awb, car, src, detail = lookup_awb_mcf_first(order_id, secrets=secrets, mcf_token=token)
+            if awb:
+                tn, cc, mcf_status = awb, car or src, detail or "Found"
+            else:
+                mcf_status = detail or "NotFound"
 
         if tn:
             remark = f"Tracking Added {datetime.now().strftime('%d/%m %H:%M')}"
@@ -158,25 +165,118 @@ def fetch_all():
                     time.sleep(0.4)
                     continue
 
+            shop_hit = get_shopify_fulfillment_tracking(order_id, shopify_cfg=shopify_cfg)
+            if shop_hit:
+                tn = shop_hit["tracking_no"]
+                cc = shop_hit["carrier"]
+                sheet_src = infer_sheet_source_q(cc, tn) or "Shopify"
+                remark = f"Shopify sync {datetime.now().strftime('%d/%m %H:%M')}"
+                db.update_order_tracking(order_id, cc or sheet_src, tn, "")
+                s_ok, s_msg = shopify_fulfill(
+                    order_id,
+                    shopify_cfg,
+                    tracking_info={
+                        "number": tn,
+                        "company": cc or sheet_src,
+                        "url": build_tracking_url(cc or sheet_src, tn),
+                    },
+                )
+                sheet_updates.append({
+                    "row": order["row_number"],
+                    "carrier": cc or sheet_src,
+                    "tracking_no": tn,
+                    "url": build_tracking_url(cc or sheet_src, tn),
+                    "status": "Intransit",
+                })
+                fulfilled_qr_updates.append({
+                    "row": order["row_number"],
+                    "source": sheet_src,
+                    "status": "FULFILLED",
+                })
+                found_count += 1
+                print(f"FOUND Shopify {tn} ({cc or sheet_src}) | Shopify: {'OK' if s_ok else s_msg}")
+                result_rows.append({
+                    "Order ID": order_id,
+                    "Customer": order["customer"],
+                    "Status": "Found on Shopify",
+                    "Tracking ID": tn,
+                    "Carrier": cc or sheet_src,
+                    "Shopify": "OK" if s_ok else s_msg,
+                    "Sheet": "pending update" if not sheets_svc else "updated",
+                })
+                time.sleep(0.4)
+                continue
+
+            if (mcf_status or "").strip().lower() == "unfulfillable":
+                status_label = "MCF: Unfulfillable"
+                sheet_updates.append({
+                    "row": order["row_number"],
+                    "carrier": "",
+                    "tracking_no": "",
+                    "url": "",
+                    "remark": status_label,
+                })
+                no_trk_remark_updates.append({
+                    "row": order["row_number"],
+                    "source": "MCF",
+                    "status": "FULFILLED",
+                })
+                print(f"unfulfillable ({status_label})")
+                result_rows.append({
+                    "Order ID": order_id,
+                    "Customer": order["customer"],
+                    "Status": status_label,
+                    "Tracking ID": "",
+                    "Carrier": "",
+                    "Shopify": "",
+                    "Sheet": status_label,
+                })
+                time.sleep(0.4)
+                continue
+
             if is_delhivery_first:
                 status_label = "Delhivery: Not Found"
-            else:
+            elif mcf_status in ("Planning", "Received", "Processing", "Complete", "Cancelled"):
                 status_label = {
-                    "Planning": "MCF: Planning", "Received": "MCF: Received", "Processing": "MCF: Processing",
-                    "Complete": "MCF: Complete", "Cancelled": "MCF: Cancelled", "NotFound": "MCF: Not Found",
+                    "Planning": "MCF: Planning",
+                    "Received": "MCF: Received",
+                    "Processing": "MCF: Processing",
+                    "Complete": "MCF: Complete",
+                    "Cancelled": "MCF: Cancelled",
                 }.get(mcf_status, f"MCF: {mcf_status}")
-
-            sheet_updates.append({
-                "row": order["row_number"], "carrier": "", "tracking_no": "", "url": "", "remark": status_label,
-            })
-            no_trk_remark_updates.append({
-                "row": order["row_number"], "source": "Delhivery" if is_delhivery_first else "MCF", "status": "FULFILLED",
-            })
-            print(f"not found ({status_label})")
-            result_rows.append({
-                "Order ID": order_id, "Customer": order["customer"], "Status": status_label,
-                "Tracking ID": "", "Carrier": "", "Shopify": "", "Sheet": status_label,
-            })
+                sheet_updates.append({
+                    "row": order["row_number"],
+                    "carrier": "",
+                    "tracking_no": "",
+                    "url": "",
+                    "remark": status_label,
+                })
+                no_trk_remark_updates.append({
+                    "row": order["row_number"],
+                    "source": "Delhivery" if is_delhivery_first else "MCF",
+                    "status": "FULFILLED",
+                })
+                print(f"pending ({status_label})")
+                result_rows.append({
+                    "Order ID": order_id,
+                    "Customer": order["customer"],
+                    "Status": status_label,
+                    "Tracking ID": "",
+                    "Carrier": "",
+                    "Shopify": "",
+                    "Sheet": status_label,
+                })
+            else:
+                print("no AWB yet — sheet unchanged")
+                result_rows.append({
+                    "Order ID": order_id,
+                    "Customer": order["customer"],
+                    "Status": mcf_status or "Pending",
+                    "Tracking ID": "",
+                    "Carrier": "",
+                    "Shopify": "",
+                    "Sheet": "unchanged",
+                })
 
         time.sleep(0.4)
 
