@@ -634,6 +634,23 @@ def fulfill_order(order, headers, shop_url, tracking_info=None):
 # ─────────────────────────────────────────────
 # AMAZON MCF
 # ─────────────────────────────────────────────
+# MCF is only for destinations south of Maharashtra (below MH on the map).
+MCF_ALLOWED_STATES = {
+    "GA", "GOA",
+    "KA", "KARNATAKA",
+    "KL", "KERALA",
+    "TN", "TAMIL NADU", "TAMILNADU",
+    "AP", "ANDHRA PRADESH",
+    "TS", "TG", "TELANGANA",
+    "PY", "PUDUCHERRY", "PONDICHERRY",
+}
+
+
+def is_mcf_eligible_state(state_code) -> bool:
+    """Return True only for Indian states/UTs south of Maharashtra."""
+    return str(state_code or "").strip().upper() in MCF_ALLOWED_STATES
+
+
 def round_mcf_amount(value) -> str:
     """Amazon India MCF expects whole INR amounts (no decimals)."""
     try:

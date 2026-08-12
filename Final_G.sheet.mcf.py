@@ -7,6 +7,8 @@ from datetime import datetime
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
 
+from utils import is_mcf_eligible_state
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # =========================
@@ -240,6 +242,10 @@ def process_orders():
     for order_id, o_data in grouped_orders.items():
         if not o_data["items"]:
             # Could skip entirely if there's no item found for an order
+            continue
+
+        if not is_mcf_eligible_state(o_data.get("state_code", "")):
+            print(f"⏭️ Skipping {order_id}: MCF only for states south of MH ({o_data.get('state_code', '')})")
             continue
             
         full_address = f"{o_data['addr1']} {o_data['addr2']}"

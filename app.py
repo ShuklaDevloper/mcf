@@ -31,6 +31,7 @@ from utils import (
     get_shopify_config,
     get_shopify_order,
     infer_sheet_source_q,
+    is_mcf_eligible_state,
     init_sheets_service,
     normalize_mcf_payment_information_list,
     parse_date,
@@ -180,8 +181,9 @@ def fetch_endpoint_orders():
             else ""
         )
 
-        if state_code in ["UP", "UTTAR PRADESH", "DELHI", "NEW DELHI", "DL", "HARYANA", "HR"]:
-            issue = f"Blocked MCF State ({state_code})" if not issue else issue
+        mcf_state_ok = is_mcf_eligible_state(state_code)
+        if not mcf_state_ok and not issue:
+            issue = f"MCF: South-only (below MH) — {state_code or 'Unknown'}"
 
         is_cod_flag = str(o.get("is_cod", "")).lower() in ["true", "yes", "1", "cod"]
 
@@ -231,8 +233,6 @@ def fetch_endpoint_orders():
         }
 
         is_err = "error" in str(fulfilled).lower() or "fail" in str(fulfilled).lower() or "error" in str(o.get("status", "")).lower()
-        if state_code in ["UP", "UTTAR PRADESH", "DELHI", "NEW DELHI", "DL", "HARYANA", "HR"]:
-            is_err = True
 
         # Check if any SKU in this order is blocked from MCF
         order_skus = [s.strip() for s in seller_sku.split(",") if s.strip()]
@@ -246,7 +246,7 @@ def fetch_endpoint_orders():
         if (not source and not fulfilled) or is_err:
             row["select"] = False if is_err else True
             row["is_error"] = is_err
-            row["path"] = "MCF"
+            row["path"] = "MCF" if mcf_state_ok else "Delhivery"
             if not is_mcf_blocked:  # Don't add blocked SKU orders to MCF pending queue
                 pending.append(row)
         elif source:
@@ -865,6 +865,16 @@ def _process_orders(full_df, selected, mcf_sel, del_sel):
             for _, row in mcf_sel.iterrows():
                 order_id = row["order_id"]
                 status_text.text(f"MCF: Processing {order_id}...")
+
+                if not is_mcf_eligible_state(row.get("state_code", "")):
+                    msg = f"MCF blocked: only south-of-MH states allowed ({row.get('state_code', '')})"
+                    log.append({
+                        "order_id": order_id, "path": "MCF", "ok": False,
+                        "msg": msg, "shopify": "—", "tracking": "—",
+                    })
+                    done += 1
+                    progress.progress(done / total)
+                    continue
 
                 # ── Check Shopify Fulfillment Status Before Processing ──
                 s_order = get_shopify_order(order_id, shopify_cfg["headers"], shopify_cfg["shop_url"])
