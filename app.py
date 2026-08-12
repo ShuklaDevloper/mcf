@@ -7,6 +7,7 @@ Run: streamlit run app.py
 import io
 import re
 import time
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -22,6 +23,7 @@ from utils import (
     clean_phone_number,
     create_delhivery_order,
     create_mcf_order,
+    fetch_apps_script_payload,
     format_sheet_cell_value,
     fulfill_order,
     get_access_token,
@@ -80,6 +82,7 @@ ss("token", None)
 ss("token_time", None)
 ss("pending_df", None)
 ss("processed_df", None)
+ss("_full_snapshot_loaded", False)
 ss("processing_log", [])
 ss("page", "Dashboard")
 
@@ -135,17 +138,8 @@ with st.sidebar:
 # ─────────────────────────────────────────────
 # HELPER: Fetch from Apps Script Endpoint
 # ─────────────────────────────────────────────
-def fetch_endpoint_orders():
-    """Fetch all orders from Apps Script. Returns (pending_list, processed_list, error)."""
-    try:
-        resp = requests.get(APPS_SCRIPT_URL, timeout=90)
-        data = resp.json()
-    except Exception as e:
-        return [], [], f"Endpoint error: {e}"
-
-    if not data.get("success"):
-        return [], [], "Endpoint returned success=false"
-
+def _split_endpoint_orders(data):
+    """Split Apps Script payload into pending and processed order rows."""
     pending, processed = [], []
     try:
         repeat_phones = set(db.get_all_phones())
@@ -173,7 +167,7 @@ def fetch_endpoint_orders():
 
         is_valid = addr_valid and pin_valid and phone_valid
         state_code = str(o.get("state_code", "")).strip().upper()
-        
+
         issue = (
             "Address overflow" if not addr_valid
             else "Invalid pincode" if not pin_valid
@@ -189,13 +183,13 @@ def fetch_endpoint_orders():
 
         raw_qty = str(o.get("qty", "1")).strip()
         seller_sku = str(o.get("seller_sku", "")).strip()
-        
+
         is_multi = False
         if "," in raw_qty or "," in seller_sku:
             is_multi = True
         elif raw_qty.isdigit() and int(raw_qty) > 1:
             is_multi = True
-            
+
         is_repeat = (phone in repeat_phones) or (current_batch_phones.get(phone, 0) > 1)
 
         row = {
@@ -234,41 +228,71 @@ def fetch_endpoint_orders():
 
         is_err = "error" in str(fulfilled).lower() or "fail" in str(fulfilled).lower() or "error" in str(o.get("status", "")).lower()
 
-        # Check if any SKU in this order is blocked from MCF
         order_skus = [s.strip() for s in seller_sku.split(",") if s.strip()]
         is_mcf_blocked = any(sku in MCF_BLOCKED_SKUS for sku in order_skus)
         if is_mcf_blocked:
             if not issue:
-                issue = f"MCF Blocked SKU"
+                issue = "MCF Blocked SKU"
             row["issue"] = issue
-            is_err = True  # Treat as error so it won't be auto-selected
+            is_err = True
 
         if (not source and not fulfilled) or is_err:
             row["select"] = False if is_err else True
             row["is_error"] = is_err
             row["path"] = "MCF" if mcf_state_ok else "Delhivery"
-            if not is_mcf_blocked:  # Don't add blocked SKU orders to MCF pending queue
+            if not is_mcf_blocked:
                 pending.append(row)
         elif source:
             processed.append(row)
 
+    return pending, processed
+
+
+def fetch_endpoint_orders(status="all"):
+    """Fetch orders from Apps Script. Returns (pending_list, processed_list, error)."""
+    try:
+        data = fetch_apps_script_payload(status=status)
+    except Exception as e:
+        return [], [], str(e)
+
+    if not data.get("success"):
+        return [], [], "Endpoint returned success=false"
+
+    pending, processed = _split_endpoint_orders(data)
     return pending, processed, None
 
 
 @st.cache_data(ttl=120)
-def _cached_endpoint_snapshot():
-    """Cached Apps Script fetch — safe for Streamlit Cloud (SQLite often empty)."""
-    return fetch_endpoint_orders()
+def _cached_endpoint_snapshot(status="pending"):
+    """Cached Apps Script fetch — pending is fast; all is used for processed/history."""
+    return fetch_endpoint_orders(status=status)
 
 
 def ensure_sheet_orders_loaded():
-    """Load pending/processed from sheet once per session (first page visit)."""
+    """Load pending orders first (fast). Full sheet load is optional/lazy."""
     if st.session_state.pending_df is not None:
         return
-    pending, processed, err = _cached_endpoint_snapshot()
+    pending, processed, err = _cached_endpoint_snapshot("pending")
     st.session_state.pending_df = pd.DataFrame(pending) if pending else pd.DataFrame()
     st.session_state.processed_df = pd.DataFrame(processed) if processed else pd.DataFrame()
     st.session_state._endpoint_snapshot_error = err
+    st.session_state._full_snapshot_loaded = False
+
+
+def ensure_full_sheet_loaded(show_spinner=False):
+    """Load the full sheet snapshot for processed orders and dashboard totals."""
+    if st.session_state.get("_full_snapshot_loaded"):
+        return None
+    loader = st.spinner("Loading full sheet (6747+ orders, ~1–2 min)...") if show_spinner else nullcontext()
+    with loader:
+        pending, processed, err = _cached_endpoint_snapshot("all")
+    if err:
+        return err
+    st.session_state.pending_df = pd.DataFrame(pending) if pending else pd.DataFrame()
+    st.session_state.processed_df = pd.DataFrame(processed) if processed else pd.DataFrame()
+    st.session_state._endpoint_snapshot_error = None
+    st.session_state._full_snapshot_loaded = True
+    return None
 
 
 def _parse_row_date_for_filter(val):
@@ -572,6 +596,14 @@ def stat_card(col, label, value, color="#1f77b4"):
 def page_dashboard():
     st.title("📊 Dashboard")
     ensure_sheet_orders_loaded()
+    if not st.session_state.get("_full_snapshot_loaded"):
+        st.caption("Pending orders loaded. Full dashboard counts need the complete sheet.")
+        if st.button("📥 Load full sheet stats", key="dash_load_full"):
+            err = ensure_full_sheet_loaded(show_spinner=True)
+            if err:
+                st.error(f"Sheet endpoint: {err}")
+            else:
+                st.rerun()
     err = st.session_state.get("_endpoint_snapshot_error")
     if err:
         st.error(f"Sheet endpoint: {err}")
@@ -659,16 +691,26 @@ def page_orders():
 
     if st.button("🔄 Refresh from Endpoint", type="primary"):
         _cached_endpoint_snapshot.clear()
-        with st.spinner("Fetching from Google Sheet endpoint..."):
-            pending, processed, err = fetch_endpoint_orders()
-            if err:
-                st.error(err)
+        st.session_state._full_snapshot_loaded = False
+        with st.spinner("Fetching pending orders..."):
+            pending, _, err = fetch_endpoint_orders(status="pending")
+        if err:
+            st.error(err)
+            st.session_state._endpoint_snapshot_error = err
+        else:
+            st.session_state.pending_df = pd.DataFrame(pending) if pending else pd.DataFrame()
+            st.session_state.processed_df = pd.DataFrame()
+            st.session_state.processing_log = []
+            st.session_state._endpoint_snapshot_error = None
+            with st.spinner("Fetching full sheet for processed orders (~1–2 min)..."):
+                pending_all, processed, err2 = fetch_endpoint_orders(status="all")
+            if err2:
+                st.warning(f"Pending loaded ({len(pending)}). Full sheet failed: {err2}")
             else:
-                st.session_state.pending_df = pd.DataFrame(pending) if pending else pd.DataFrame()
+                st.session_state.pending_df = pd.DataFrame(pending_all) if pending_all else pd.DataFrame()
                 st.session_state.processed_df = pd.DataFrame(processed) if processed else pd.DataFrame()
-                st.session_state.processing_log = []
-                st.session_state._endpoint_snapshot_error = None
-                st.success(f"✅ Pending: {len(pending)} | Already Processed: {len(processed)}")
+                st.session_state._full_snapshot_loaded = True
+                st.success(f"✅ Pending: {len(pending_all)} | Already Processed: {len(processed)}")
 
     tab1, tab2 = st.tabs(["⏳ Pending Orders", "✅ Already Processed"])
 
@@ -792,6 +834,14 @@ def page_orders():
 
     # ── TAB 2: ALREADY PROCESSED ────────────────────────────────────────
     with tab2:
+        if not st.session_state.get("_full_snapshot_loaded"):
+            st.info("Processed orders need the full sheet (~6747 rows). Load once — takes ~1–2 min.")
+            if st.button("📥 Load Processed Orders", key="orders_load_processed"):
+                err = ensure_full_sheet_loaded(show_spinner=True)
+                if err:
+                    st.error(err)
+                else:
+                    st.rerun()
         df2 = st.session_state.processed_df
         if df2 is None or df2.empty:
             st.info("No processed orders found.")
@@ -1990,8 +2040,7 @@ def _render_awb_fetch():
     if st.button("🔄 Load MCF Orders from Sheet", key="load_mcf_btn"):
         with st.spinner("Sheet se MCF orders fetch kar raha hoon..."):
             try:
-                resp = requests.get(APPS_SCRIPT_URL, timeout=90)
-                data = resp.json()
+                data = fetch_apps_script_payload(status="all")
                 mcf_orders = []
                 for o in data.get("orders", []):
                     source = str(o.get("source", "")).strip().upper()
@@ -2356,8 +2405,7 @@ def page_sync():
     if st.button("▶ Manual Sync Now", type="primary"):
         with st.spinner("Syncing from Apps Script endpoint..."):
             try:
-                resp = requests.get(APPS_SCRIPT_URL, timeout=90)
-                data = resp.json()
+                data = fetch_apps_script_payload(status="pending")
 
                 if not data.get("success") or not data.get("orders"):
                     st.warning("No orders from endpoint")
@@ -2417,6 +2465,7 @@ def page_sync():
                     st.session_state.pending_df = None
                     st.session_state.processed_df = None
                     st.session_state._endpoint_snapshot_error = None
+                    st.session_state._full_snapshot_loaded = False
 
             except Exception as e:
                 st.error(f"Sync failed: {e}")

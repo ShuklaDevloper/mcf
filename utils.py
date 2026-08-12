@@ -5,6 +5,7 @@ All API integrations: Amazon SP-API (MCF), Delhivery, Shopify, Google Sheets
 import os
 import re
 import json
+import time
 import requests
 import urllib3
 from datetime import datetime
@@ -195,11 +196,49 @@ def init_sheets_service(secrets=None):
     return build("sheets", "v4", credentials=creds)
 
 
-def fetch_orders_from_apps_script(timeout=90):
-    """Load all orders from the Apps Script endpoint (no Sheets API creds needed)."""
-    resp = requests.get(APPS_SCRIPT_URL, timeout=timeout)
-    resp.raise_for_status()
-    data = resp.json()
+def apps_script_url(status="all"):
+    """Build Apps Script URL for get_orders with a status filter (all|pending)."""
+    return re.sub(r"status=[^&]+", f"status={status}", APPS_SCRIPT_URL)
+
+
+def fetch_apps_script_payload(status="all", timeout=180, retries=3):
+    """Fetch JSON from the Google Apps Script web app with retries."""
+    url = apps_script_url(status)
+    last_err = None
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, timeout=timeout, allow_redirects=True)
+            resp.raise_for_status()
+            text = (resp.text or "").strip()
+            if not text:
+                raise ValueError("Empty response from Google Apps Script endpoint")
+            try:
+                data = resp.json()
+            except json.JSONDecodeError as exc:
+                snippet = text[:240].replace("\n", " ")
+                raise ValueError(
+                    f"Invalid JSON (HTTP {resp.status_code}, {len(text)} bytes): {snippet}"
+                ) from exc
+            if not isinstance(data, dict):
+                raise ValueError("Endpoint returned non-object JSON")
+            return data
+        except requests.exceptions.Timeout as exc:
+            last_err = exc
+        except (requests.exceptions.RequestException, ValueError) as exc:
+            last_err = exc
+        if attempt < retries - 1:
+            time.sleep(min(2 ** attempt, 8))
+    if isinstance(last_err, requests.exceptions.Timeout):
+        raise TimeoutError(
+            f"HTTPSConnectionPool(host='script.google.com', port=443): "
+            f"Read timed out. (read timeout={timeout})"
+        ) from last_err
+    raise RuntimeError(f"Endpoint error: {last_err}") from last_err
+
+
+def fetch_orders_from_apps_script(timeout=180, status="all", retries=3):
+    """Load orders from the Apps Script endpoint (no Sheets API creds needed)."""
+    data = fetch_apps_script_payload(status=status, timeout=timeout, retries=retries)
     if not data.get("success"):
         return []
     return data.get("orders", [])
