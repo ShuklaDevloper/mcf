@@ -370,7 +370,8 @@ def build_pkg_from_sheet_and_delhivery(
     pin = row_get(order_row, i_pin)
     city = row_get(order_row, i_city)
     state = row_get(order_row, i_state)
-    iscod = row_get(order_row, i_cod).lower()
+    iscod_raw = row_get(order_row, i_cod)
+    iscod = iscod_raw.lower()
     amount = to_float(row_get(order_row, i_amount))
     sku = row_get(order_row, i_sku)
     title = row_get(order_row, i_title)
@@ -405,7 +406,14 @@ def build_pkg_from_sheet_and_delhivery(
         new_pkg["destination"] = f"{city} ({state})".strip()
 
     new_pkg["rs"] = amount if amount else new_pkg.get("rs", 0)
-    new_pkg["cod"] = int(amount) if ("cod" in iscod or iscod == "true") else 0
+    is_cod_order = "cod" in iscod or iscod == "true"
+    new_pkg["cod"] = int(amount) if is_cod_order else 0
+
+    # Reflect the sheet's Prepaid/COD text directly onto the label's payment-type box
+    # (Sheet value wins over whatever Delhivery's packing slip said, same as the
+    # other sheet-derived fields above.)
+    if iscod_raw:
+        new_pkg["pt"] = "COD" if is_cod_order else "PPD"
 
     if not new_pkg.get("client_gst_tin"):
         new_pkg["client_gst_tin"] = SENDER_GST
